@@ -1,0 +1,144 @@
+为了将针对第 53 题的复盘经验转化为**适用于所有类似复杂题目**的通用方案，我们需要对 Agent 的核心架构进行三个维度的升级：**结构化规划（Reasoning）**、**广度优先搜索策略（Search Strategy）** 和 **模糊逻辑验证（Fuzzy Verification）**。
+
+以下是通用的优化方案：
+
+### 一、 推理层优化：引入“漏斗式”候选人枚举逻辑
+
+现有的 Agent 容易陷入“早熟收敛”（Premature Convergence），即找到一个**像**答案的人（如现任总理）就死磕。通用的解决思路是改“单点验证”为“列表筛选”。
+
+#### 1. 结构化槽位提取 (Slot Filling)
+
+不要直接搜索整句 Query，而是先让 LLM 提取四个核心槽位。对于任何题目（无论是 Q53 的蒙古总理，还是 Q0 的欧洲学者），都适用：
+
+* **主体类型 (Type)**: 人物 / 公司 / 组织
+* **硬约束 (Hard Constraints)**: 绝对不能错的（时间、地点、核心事件）。
+* *Q53 示例*: 国家=蒙古, 宪法=1992生效/2019修订, 角色=政府首脑。
+
+
+* **软约束 (Soft Constraints)**: 可能存在描述偏差的（任命方式、具体风波细节）。
+* *Q53 示例*: 亲属财产风波、由元首任命（可能指形式上的任命）。
+
+
+* **关键锚点 (Anchor)**: 最容易搜索的独特词。
+* *Q53 示例*: "矿产腐败"、"2019年修宪"。
+
+
+
+#### 2. “列表-筛选”模式 (List-then-Filter Pattern)
+
+**修改 Agent Loop 的规划逻辑：**
+
+* **Step 1: 锁定范围**。先确定国家/行业/组织。
+* **Step 2: 全量枚举**。不要问“谁是那个……的人”，而是问“列出该国/该组织在[时间段]内的**所有**历任领导人/产品/项目”。
+* *通用 Prompt*: "Please list all [Prime Ministers of Mongolia] from [2010] to [2025]. For each, succinctly state their education and major scandals."
+
+
+* **Step 3: 逐一比对**。Agent 获取列表后，自行比对约束条件，而不是依赖搜索引擎直接返回唯一答案。
+
+**收益**：这能解决 Agent 盯着现任者（奥云额尔登）不放，而忽略了前任者（巴特包勒德）的问题。
+
+### 二、 搜索层优化：多维视角与语言突破
+
+#### 1. 强制多语言搜索 (Cross-Lingual Search)
+
+这是解决国际类题目（Q0, Q53, Q66等）的杀手锏。中文互联网对于非英语国家的政治/商业细节报道往往滞后或简略。
+
+* **逻辑**：检测到题目涉及特定国家（如蒙古、日本、欧洲）时，强制生成 **英文 Query** 甚至 **当地语言 Query**。
+* **代码实现思路**：
+```python
+# 在 agent.py 的 smart-search 或 web_search 中增加
+def expand_query_language(query, target_country):
+    queries = [query] # 原中文
+    queries.append(translate_to_english(query)) # 英文
+    if target_country == "Mongolia":
+        queries.append(translate_to_cyrillic_mongolian(query)) # 蒙文(可选)
+    return queries
+
+```
+
+
+* **Q53 效果**：搜中文“亲属财产风波”可能无果，但搜英文 `"Sükhbaataryn Batbold" offshore assets lawsuit` 或 `"Mongolia" Prime Minister "corruption" relatives` 会直接命中路透社关于他在伦敦及纽约因隐藏资产被起诉的报道。
+
+#### 2. 关键词泛化与去噪 (Query Expansion & Denoising)
+
+很多题目使用“谜语”描述（如“海外知名学府”而不是“哈佛”）。
+
+* **同义词扩展**：搜索时自动将模糊词具体化。
+* "海外知名学府" -> `"Ivy League" OR "Oxbridge" OR "study abroad"`
+* "亲属财产风波" -> `"corruption" OR "scandal" OR "embezzlement" OR "lawsuit" OR "illicit enrichment"`
+
+
+* **布尔逻辑增强**：对于多条件，使用 AND/OR 组合，而不是长句。
+* *Bad*: `蒙古国总理因亲属财产风波受挫`
+* *Good*: `Mongolia Prime Minister AND (scandal OR corruption) AND (relatives OR wife OR son)`
+
+
+
+### 三、 验证层优化：模糊逻辑与负向反馈
+
+目前的 Verifier 太过刚性（Binary Check），导致“查无此人”或“死循环”。
+
+#### 1. 引入“置信度打分” (Confidence Scoring)
+
+不要只返回 `[REJECTED]`，而是返回匹配度分析。
+
+* **Prompt 调整**：
+> "请对候选人进行打分（0-10）。
+> * 核心事实（国家、职位、宪法时间）匹配得 5 分。
+> * 细节（留学、风波）匹配得 3 分。
+> * 模糊描述（任命方式）不匹配扣 1 分，但**不要直接否决**，除非核心事实错误。"
+> 
+> 
+
+
+
+#### 2. 比较式验证 (Comparative Verification)
+
+当 Agent 找到一个候选人（如奥云额尔登）但验证不完美时，强制 Agent **寻找竞争对手**。
+
+* **逻辑**：Verifier 发现某一项不符（如“挫折程度不够”），应返回指令：
+> `[DOUBT]: 奥云额尔登符合部分条件，但“重大挫折”存疑。请搜索该国**其他**符合条件的前任总理，对比谁的丑闻更严重。`
+
+
+* **通用性**：这适用于所有“最...”或“唯一...”类题目。
+
+#### 3. 负向搜索验证 (Negative Search)
+
+在确认答案前，专门执行一次“证伪搜索”。
+
+* **Action**: 如果候选人是 A，搜 `A scandal relatives`。如果没有结果，搜 `A controversy` 看是否有其他匹配项被误读了。
+* *Q53 应用*: 专门搜 `Oyun-Erdene relatives scandal` 发现主要是他在反腐（他是猎人不是猎物），搜 `Batbold relatives scandal` 发现他被全球追债（他是猎物），从而确立 Batbold 才是正解。
+
+### 四、 代码/Prompt 落地清单
+
+建议在 `agent.py` 和 `agent_loop.py` 中落实以下具体改动：
+
+1. **修改 `multi_hop_search` Skill**：
+增加 `enumerate_candidates` 步骤。
+```python
+# 伪代码
+if intent == "find_person":
+    candidates = web_search(f"List of {role} of {country} since {year}")
+    for person in candidates:
+         verify_attributes(person, constraints)
+
+```
+
+
+2. **修改 `verify_answer` 的 System Prompt**：
+增加容错指令：
+```text
+SYSTEM: You are a logic validator, not a syntax checker.
+1. If the "Appointment Method" is technically debated (e.g. President appoints vs. Parliament elects), accept it if the Country and Person are correct.
+2. Focus on UNIQUE identifiers (specific lawsuits, specific constitution years) over generic descriptions.
+
+```
+
+
+3. **增加 `pivot_search` 机制**：
+在 `agent_loop.py` 的重试逻辑中，如果连续两次搜索人名失败，强制切换搜索对象：
+> "检测到人名搜索陷入僵局，切换策略：先搜索**事件**（2019年修宪、矿产腐败案），找到事件关联的人，再反向验证。"
+
+
+
+通过这一套组合拳，Agent 不再是撞大运式的搜索，而是像人类侦探一样：**划定范围 -> 列出嫌疑人 -> 逐个排查 -> 交叉验证**，从而大幅提高复杂题目的解决率。

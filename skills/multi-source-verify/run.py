@@ -138,12 +138,20 @@ def main():
             "expected": "至少1个 .edu/.gov 来源支持"
         })
 
-        # 查询4: 检查冲突信息
+        # 查询4: 检查冲突信息 (反向验证)
         verification_queries.append({
-            "purpose": "检查冲突信息",
-            "query": f'"{target}" controversy OR dispute OR incorrect',
+            "purpose": "检查冲突信息/反向验证",
+            "query": f'"{target}" controversy OR dispute OR incorrect OR debunked OR hoax',
             "expected": "无冲突信息,或冲突已被澄清"
         })
+
+        # 查询5: 竞争性假设验证 (如果是 "唯一" 类的声明)
+        if "first" in target.lower() or "invented" in target.lower() or "founder" in target.lower() or "best" in target.lower():
+             verification_queries.append({
+                "purpose": "竞争性假设验证",
+                "query": f'"{target}" vs OR alternative OR other candidates',
+                "expected": "确认没有更有力的竞争候选"
+            })
 
         # 输出结果
         result = {
