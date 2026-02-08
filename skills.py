@@ -296,6 +296,8 @@ class SkillIntegrationTools:
                 return f"<stdout></stdout><stderr>Error: Unsupported script type: {script_path.name}</stderr>"
 
             try:
+                env["PYTHONIOENCODING"] = "utf-8"  # 确保子进程使用UTF-8编码
+
                 completed = subprocess.run(
                     command,
                     shell=False,  # Use shell=False for better security
@@ -304,6 +306,7 @@ class SkillIntegrationTools:
                     stderr=subprocess.PIPE,
                     timeout=DEFAULT_SCRIPT_TIMEOUT,
                     text=True,
+                    encoding='utf-8',
                     errors="replace",
                     env=env,
                 )

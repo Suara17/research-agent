@@ -13,6 +13,8 @@ from openai import OpenAI
 # HTTP Session
 # -------------------------------------------------------------------------
 
+import random
+
 def get_session() -> requests.Session:
     session = requests.Session()
     retry_strategy = Retry(
@@ -25,13 +27,27 @@ def get_session() -> requests.Session:
     adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=10)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
+    
+    # User-Agent Rotation List
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:122.0) Gecko/20100101 Firefox/122.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/121.0.0.0 Safari/537.36"
+    ]
+    
     session.headers.update(
         {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": random.choice(user_agents),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
+            "Sec-Ch-Ua": '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
         }
     )
     return session
@@ -59,6 +75,22 @@ def clean_answer(raw_answer: str) -> str:
     if not raw_answer:
         return ""
     
+    # 0. 优先提取 "Final Answer:" 后的内容
+    # Use regex to find "Final Answer:" (case insensitive) and capture everything after it
+    # We look for the last occurrence to avoid capturing intermediate thoughts if any slipped through
+    final_answer_match = re.search(r"Final Answer[:：]\s*(.*)", raw_answer, re.IGNORECASE | re.DOTALL)
+    if final_answer_match:
+        # If found, replace raw_answer with the captured content
+        # We take the content after the marker
+        extracted = final_answer_match.group(1).strip()
+        if extracted:
+             raw_answer = extracted
+             # Also check if there are any trailing "Thought:" sections and remove them
+             # (In case the model outputs Final Answer then starts thinking again)
+             thought_match = re.search(r"(.*?)Thought[:：]", raw_answer, re.IGNORECASE | re.DOTALL)
+             if thought_match:
+                 raw_answer = thought_match.group(1).strip()
+
     # 1. 去除 Markdown 标记 (只去除 ``` 符号，保留内容)
     clean = re.sub(r'```\w*', '', raw_answer)
     clean = clean.replace('```', '')
@@ -98,14 +130,84 @@ def clean_answer(raw_answer: str) -> str:
         if not changed:
             break
 
-    # 4. 激进清洗
+    # 4. 去除常见的废话后缀 (尤其是表示不确定的后缀)
+    suffix_patterns = [
+        r"[\(（]未检索到明确答案[\)）]$",
+        r"[\(（]未找到明确答案[\)）]$",
+        r"未检索到明确答案$",
+        r"未找到明确答案$",
+        r"No clear answer found$",
+        r"not found$",
+        r"[\(（]not found[\)）]$",
+        r"Unknown$",
+        r"无法确定$",
+        r"[\(（]uncertain[\)）]$"
+    ]
+    
+    for _ in range(3):
+        changed = False
+        for p in suffix_patterns:
+            # specifically for suffixes, using sub with $ might be enough, but regex replacement is safer
+            new_clean = re.sub(p, "", clean, flags=re.IGNORECASE).strip()
+            if new_clean != clean:
+                clean = new_clean
+                changed = True
+        if not changed:
+            break
+
+    # 5. Remove trailing punctuation
+    clean = clean.strip(" .,;?!。，；？！")
+            
+    # 4. 激进清洗 (Original logic continues)
     clean = clean.strip(" 。.,'\"")
     
     # [New] Remove common noise suffixes like "List"
     if clean.endswith("List") and len(clean) > 4 and clean[-5] != " ":
         clean = clean[:-4]
     
-    # 5. 去重逻辑 (增强版 - Simplified for migration)
+    # 5. 去重逻辑 (增强版 - 防止混乱拼接)
+    # 先检测并修复混乱拼接（如 '196419661966' -> '1966'）
+    if clean and len(clean) >= 4:
+        # 检查是否是纯数字且长度为4的倍数（可能是年份重复）
+        if clean.isdigit() and len(clean) % 4 == 0 and len(clean) > 4:
+            # 尝试按4位分割
+            chunks = [clean[i:i+4] for i in range(0, len(clean), 4)]
+            # 如果所有块都是有效年份（1900-2100），取最后一个
+            if all(1900 <= int(c) <= 2100 for c in chunks):
+                clean = chunks[-1]
+                print(f"[CleanAnswer] 检测到年份混乱拼接，修正: '{clean}' (原始: {chunks})")
+
+    # [New] LLM Fallback: If result is still a thought trace (regex failed)
+    # Trigger if:
+    # 1. Contains thought keywords
+    # 2. OR Length > 20 words (English) or > 60 chars (approx 20-30 Chinese words/chars context)
+    # Use a simple heuristic: split by space for words, or raw length for CJK
+    word_count = len(clean.split())
+    
+    if (len(clean) > 60 or word_count > 20) or any(k in clean for k in ["Thought:", "Action:", "Observation:", "Step 1:", "首先", "我需要"]):
+        print("[CleanAnswer] Result is long or looks like a trace. Attempting LLM extraction...")
+        try:
+            client = get_llm_client()
+            response = client.chat.completions.create(
+                model="qwen3-max",
+                messages=[
+                    {"role": "system", "content": "You are an answer extractor. Read the provided text and extract the Final Answer. Output ONLY the answer text. Do not output 'The answer is...'. If no answer is found, output the most relevant conclusion."},
+                    {"role": "user", "content": f"Text:\n{clean[:2000]}"} # Truncate to avoid context limit
+                ],
+                temperature=0.1,
+                max_tokens=200
+            )
+            extracted = response.choices[0].message.content.strip()
+            # Basic validation of extracted answer
+            if extracted and len(extracted) < len(clean):
+                 # Recurse once to clean the LLM output (e.g. remove quotes)
+                 # But avoid infinite recursion by ensuring length reduced
+                 clean = extracted.strip(" `\"'")
+                 print(f"[CleanAnswer] LLM Extracted: {clean[:50]}...")
+        except Exception as e:
+            print(f"[CleanAnswer] LLM Extraction failed: {e}")
+
+    # 原有去重逻辑
     m = re.match(r'^(.+?)(?:[ \t\n。,;!?.|]+)\1$', clean, re.IGNORECASE | re.DOTALL)
     if m:
         clean = m.group(1)
@@ -133,7 +235,8 @@ class CandidatePool:
 
     def add_candidate(self, answer: str, confidence: float, sources: list):
         """添加候选答案(自动去重)"""
-        answer = str(answer or "").strip()
+        # 使用 clean_answer 进行标准化清洗
+        answer = clean_answer(answer)
         if not answer:
             return
 
@@ -202,6 +305,8 @@ def python_type_to_json_type(t):
                 return "array"
     return "string"
 
+# Cleaned up duplicate
+
 def function_to_schema(func: Callable) -> dict:
     """
     Convert a Python function to an OpenAI API Tool Schema.
@@ -241,45 +346,4 @@ def function_to_schema(func: Callable) -> dict:
 # JSON Serialization & Data Structures
 # -------------------------------------------------------------------------
 
-@dataclass
-class ToolCall:
-    tool_call_id: Optional[str] = None
-    tool_name: Optional[str] = None
-    tool_arguments: Optional[dict] = None
-
-    def to_dict(self) -> dict:
-        return {
-            "tool_call_id": self.tool_call_id,
-            "tool_name": self.tool_name,
-            "tool_arguments": self.tool_arguments
-        }
-
-@dataclass
-class Chunk:
-    step_index: int
-    type: Literal["text", "tool_call", "tool_call_result", "final_state"]
-    content: Optional[str] = None
-    tool_call: Optional[ToolCall] = None
-    tool_result: Optional[Any] = None
-
-    def to_dict(self) -> dict:
-        return {
-            "step_index": self.step_index,
-            "type": self.type,
-            "content": self.content,
-            "tool_call": self.tool_call.to_dict() if self.tool_call else None,
-            "tool_result": str(self.tool_result) if self.tool_result else None
-        }
-
-def make_json_serializable(obj: Any) -> Any:
-    """递归转换对象为可JSON序列化的格式"""
-    if isinstance(obj, (Chunk, ToolCall)):
-        return obj.to_dict()
-    elif isinstance(obj, dict):
-        return {k: make_json_serializable(v) for k, v in obj.items()}
-    elif isinstance(obj, (list, tuple)):
-        return [make_json_serializable(item) for item in obj]
-    elif hasattr(obj, '__dict__'):
-        return str(obj)
-    else:
-        return obj
+from .schema import ToolCall, Chunk, make_json_serializable

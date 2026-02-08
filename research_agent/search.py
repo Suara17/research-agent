@@ -27,10 +27,25 @@ try:
 except ImportError:
     _TRAFILATURA_AVAILABLE = False
 
+try:
+    from serpapi import GoogleSearch
+    _SERPAPI_LIB_AVAILABLE = True
+except ImportError:
+    _SERPAPI_LIB_AVAILABLE = False
+
+try:
+    from baidusearch.baidusearch import search as baidu_search
+    _BAIDU_AVAILABLE = True
+except ImportError:
+    _BAIDU_AVAILABLE = False
+
+try:
+    from googlesearch import search as google_search_scraper
+    _GOOGLE_SCRAPER_AVAILABLE = True
+except ImportError:
+    _GOOGLE_SCRAPER_AVAILABLE = False
+
 from .utils import get_session, get_llm_client, clean_answer
-from .processors import (
-    _extract_core_entities,
-)
 from .intelligent_fetcher import get_intelligent_fetcher
 
 # --- Helpers ---
@@ -39,6 +54,38 @@ _KNOWN_TIMEOUT_DOMAINS = {
     "www.cia.gov",
     "www.state.gov",
 }
+
+def _fetch_with_jina(url: str, session) -> Optional[str]:
+    """
+    尝试使用 Jina Reader 获取网页内容的 Markdown
+    """
+    try:
+        # Jina Reader URL 格式: https://r.jina.ai/<目标URL>
+        jina_url = f"https://r.jina.ai/{url}"
+        
+        # Jina 建议的 Headers
+        headers = {
+            "X-Return-Format": "markdown"
+        }
+        
+        # 15秒超时，避免阻塞太久
+        resp = session.get(jina_url, headers=headers, timeout=15)
+        
+        if resp.status_code == 200:
+            text = resp.text
+            # 简单验证内容有效性 (Jina 有时会返回错误提示 json)
+            if "jina.ai" in text and "error" in text.lower() and len(text) < 200:
+                print(f"[Jina] API returned error message: {text}")
+                return None
+                
+            return text
+        else:
+            print(f"[Jina] Failed with status code: {resp.status_code}")
+            return None
+            
+    except Exception as e:
+        print(f"[Jina] Exception during fetch: {e}")
+        return None
 
 # URL去重缓存：归一化URL -> (内容, 时间戳)
 _URL_FETCH_CACHE = {}
@@ -95,32 +142,11 @@ def _filter_search_results(results: list) -> list:
     return filtered
 
 def _rerank_search_results(results, query: str, top_k: int):
-    try:
-        ents = _extract_core_entities(query)
-        if not results:
-            return results
-        if not ents:
-            return results[:top_k]
-        ents_lower = [str(e).lower() for e in ents if str(e).strip()]
-        scored = []
-        for idx, r in enumerate(results):
-            title = str((r.get("title") or "")).lower()
-            snippet = str(r.get("summary") or r.get("snippet") or "").lower()
-            score = 0.0
-            for e in ents_lower:
-                if not e: continue
-                if e in title: score += 2.0
-                if e in snippet: score += 1.0
-            scored.append((score, idx, r))
-        max_score = max((s for s, _, _ in scored), default=0.0)
-        if max_score > 0:
-            scored = [t for t in scored if t[0] > 0]
-        scored_sorted = sorted(scored, key=lambda t: (t[0], -t[1]), reverse=True)
-        reranked = [r for _, _, r in scored_sorted][:top_k]
-        return reranked
-    except Exception as e:
-        print(f"[Monitoring] entity_rerank_failed: {e}")
-        return results[:top_k]
+    # Deprecated: Reranking based on regex entity extraction is unreliable.
+    # We trust the search engine's ranking and the LLM's ability to filter relevant results.
+    if not results:
+        return results
+    return results[:top_k]
 
 def extract_answer_from_search_results(search_results: list, query: str) -> dict:
     try:
@@ -164,53 +190,78 @@ def extract_answer_from_search_results(search_results: list, query: str) -> dict
         return {"candidates": [], "extraction_method": "error"}
 
 def _optimize_search_query(query: str) -> str:
+    """
+    Use LLM to optimize search query for better results.
+    Preserves advanced operators (site:, filetype:) if present.
+    """
     try:
-        optimized = query.strip()
-        proper_nouns = re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b', optimized)
-        for noun in proper_nouns:
-            if f'"{noun}"' not in optimized and f"'{noun}'" not in optimized:
-                optimized = optimized.replace(noun, f'"{noun}"')
+        # 1. If query contains advanced operators, trust the user/agent and return as is (just trim)
+        if "site:" in query.lower() or "filetype:" in query.lower() or "intitle:" in query.lower():
+            return query.strip()
+
+        # 2. If query is short/simple, use regex optimization to save time
+        if len(query) < 20 and not any(k in query.lower() for k in ["who", "what", "where", "when", "why", "how"]):
+            return query.strip()
+
+        # 3. Use LLM for complex natural language queries
+        client = get_llm_client()
+        prompt = """You are a Search Engine Optimization Expert.
+Convert the user's natural language query into a PRECISE search engine query.
+
+Rules:
+1. Extract CORE KEYWORDS.
+2. Remove conversational filler ("what is", "search for", "I need to find").
+3. For specific entities (Names, Movies), use quotes "" around them.
+4. For riddles or category searches (e.g., "a unit of power"), use "List of..." pattern.
+5. KEEP IT SHORT and effective.
+
+User Query: "{query}"
+Optimized Query (output ONLY the query string):"""
         
-        wiki_keywords = [
-            'nobel prize', 'founding', 'established', 'founded',
-            'biography', 'history of', 'discovered', 'invented',
-            'born', 'died', 'award', 'winner'
-        ]
-        is_wiki_query = any(kw in optimized.lower() for kw in wiki_keywords)
+        response = client.chat.completions.create(
+            model="qwen3-max",
+            messages=[
+                {"role": "system", "content": prompt.replace("{query}", query)},
+            ],
+            temperature=0.1,
+            max_tokens=64
+        )
         
-        redundant_prefixes = [
-            'please search for', 'find information about',
-            'look up', 'search', 'find', 'what is', 'who is'
-        ]
-        for prefix in redundant_prefixes:
-            if optimized.lower().startswith(prefix):
-                optimized = optimized[len(prefix):].strip()
+        if not response or not response.choices:
+            print(f"[Monitoring] LLM returned empty response or choices")
+            return query.strip()
+            
+        optimized = response.choices[0].message.content.strip().strip('"')
+
         
-        print(f"[Monitoring] query_optimization: '{query}' → '{optimized}'")
+        # Fallback validation
+        if not optimized or len(optimized) < 3:
+            return query.strip()
+            
+        print(f"[Monitoring] LLM_query_optimization: '{query}' → '{optimized}'")
         return optimized
+
     except Exception as e:
         print(f"[Monitoring] query_optimization_error: {e}")
-        return query
+        return query.strip()
 
 def _simplify_search_query(query: str) -> str:
     try:
-        simplified = re.sub(r'site:\S+', '', query, flags=re.IGNORECASE)
-        simplified = re.sub(r'filetype:\S+', '', simplified, flags=re.IGNORECASE)
-        if len(simplified) > 30:
-            simplified = simplified.replace('"', '').replace("'", "")
+        # DO NOT remove site: or filetype: operators!
+        # simplified = re.sub(r'site:\S+', '', query, flags=re.IGNORECASE)
+        # simplified = re.sub(r'filetype:\S+', '', simplified, flags=re.IGNORECASE)
+        
+        simplified = query
+        if len(simplified) > 100: # Only truncate if extremely long
+             simplified = simplified[:100]
+             
         simplified = re.sub(r'\s+', ' ', simplified).strip()
         return simplified
     except Exception:
         return query
 
 def _create_entity_query(query: str) -> str:
-    try:
-        ents = _extract_core_entities(query)
-        valid_ents = [e for e in ents if len(e) > 1 or (e.isalnum() and len(e)==1)]
-        if valid_ents:
-            return " ".join(valid_ents)
-    except Exception:
-        pass
+    # _extract_core_entities is removed. Return empty string.
     return ""
 
 def _translate_query(query: str, target_lang: str = "English") -> str:
@@ -378,6 +429,24 @@ def web_search(query: str, top_k: int = 5) -> str:
 
             is_chinese_query = any("\u4e00" <= ch <= "\u9fff" for ch in current_q)
 
+            if is_chinese_query and _BAIDU_AVAILABLE:
+                try:
+                    results = []
+                    # baidusearch usually returns a list of dicts
+                    baidu_gen = baidu_search(current_q, num_results=k)
+                    for r in baidu_gen:
+                        results.append({
+                            "title": r.get("title"),
+                            "summary": r.get("abstract"),
+                            "url": r.get("url"),
+                        })
+                    if results:
+                        results = _filter_search_results(results)
+                        results = _rerank_search_results(results, query, k)
+                        return json.dumps({"source": "baidu", "results": results}, ensure_ascii=False)
+                except Exception as e:
+                    print(f"[Monitoring] Baidu error: {e}")
+
             if serper_key:
                 try:
                     url = "https://google.serper.dev/search"
@@ -413,65 +482,21 @@ def web_search(query: str, top_k: int = 5) -> str:
                 except Exception as e:
                     print(f"[Monitoring] Serper error (attempt {attempt_idx}): {e}")
 
-            if bocha_key:
-                try:
-                    url = "https://api.bocha.cn/v1/web-search"
-                    headers = {
-                        "Authorization": f"Bearer {bocha_key}",
-                        "Content-Type": "application/json"
-                    }
-                    payload = {
-                        "query": current_q,
-                        "count": k,
-                        "freshness": "noLimit",
-                        "summary": True
-                    }
-                    response = requests.post(url, headers=headers, json=payload, timeout=10)
-                    
-                    if response.status_code == 200:
-                        data = response.json()
-                        results = []
-                        web_pages = data.get("webPages", {}) if isinstance(data, dict) else {}
-                        if web_pages and isinstance(web_pages, dict) and "value" in web_pages and isinstance(web_pages["value"], list):
-                            for item in web_pages["value"]:
-                                if not isinstance(item, dict):
-                                    continue
-                                results.append({
-                                    "title": item.get("name"),
-                                    "summary": item.get("snippet") or item.get("summary"),
-                                    "url": item.get("url"),
-                                })
-                        elif isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
-                             for item in data["data"]:
-                                if not isinstance(item, dict):
-                                    continue
-                                results.append({
-                                    "title": item.get("name") or item.get("title"),
-                                    "summary": item.get("snippet") or item.get("summary"),
-                                    "url": item.get("url"),
-                                })
-                        
-                        if results:
-                            results = _filter_search_results(results)
-                            results = _rerank_search_results(results, query, k)
-                            return json.dumps({"source": "bocha", "results": results}, ensure_ascii=False)
-                except Exception as e:
-                    print(f"[Monitoring] Bocha error: {e}")
-
             if serpapi_key:
                 try:
-                    url = "https://serpapi.com/search"
-                    params = {
-                        "api_key": serpapi_key,
-                        "q": current_q,
-                        "engine": "google",
-                        "num": k
-                    }
-                    response = requests.get(url, params=params, timeout=15)
-                    
-                    if response.status_code == 200:
-                        data = response.json()
+                    if _SERPAPI_LIB_AVAILABLE:
+                        params = {
+                            "api_key": serpapi_key,
+                            "q": current_q,
+                            "engine": "google",
+                            "num": k,
+                            "google_domain": "google.com.hk" if is_chinese_query else "google.com",
+                            "gl": "cn" if is_chinese_query else "us",
+                            "hl": "zh-cn" if is_chinese_query else "en"
+                        }
+                        search = GoogleSearch(params)
                         results = []
+                        data = search.get_dict()
                         if "organic_results" in data:
                             for item in data["organic_results"]:
                                 results.append({
@@ -489,9 +514,71 @@ def web_search(query: str, top_k: int = 5) -> str:
                         if results:
                             results = _filter_search_results(results)
                             results = _rerank_search_results(results, query, k)
-                            return json.dumps({"source": "serpapi", "results": results}, ensure_ascii=False)
+                            return json.dumps({"source": "serpapi-lib", "results": results}, ensure_ascii=False)
+                    else:
+                        url = "https://serpapi.com/search"
+                        params = {
+                            "api_key": serpapi_key,
+                            "q": current_q,
+                            "engine": "google",
+                            "num": k
+                        }
+                        response = requests.get(url, params=params, timeout=15)
+                        
+                        if response.status_code == 200:
+                            data = response.json()
+                            results = []
+                            if "organic_results" in data:
+                                for item in data["organic_results"]:
+                                    results.append({
+                                        "title": item.get("title", ""),
+                                        "summary": item.get("snippet", ""),
+                                        "url": item.get("link", "")
+                                    })
+                            if "knowledge_graph" in data:
+                                kg = data["knowledge_graph"]
+                                results.insert(0, {
+                                    "title": kg.get("title", "Knowledge Graph"),
+                                    "summary": f"{kg.get('type', '')}: {kg.get('description', '')}",
+                                    "url": kg.get("website", "") or kg.get("source", {}).get("link", "")
+                                })
+                            if results:
+                                results = _filter_search_results(results)
+                                results = _rerank_search_results(results, query, k)
+                                return json.dumps({"source": "serpapi", "results": results}, ensure_ascii=False)
                 except Exception as e:
                     print(f"[Monitoring] SerpApi error: {e}")
+
+            if _GOOGLE_SCRAPER_AVAILABLE:
+                try:
+                    # Fallback to google-search-scraper if API keys are missing or failed
+                    # Note: This might be rate-limited
+                    results = []
+                    # google_search_scraper yields urls, we might need to fetch them or just return links?
+                    # actually the library 'googlesearch-python' yields strings (URLs) usually.
+                    # Wait, the prompt said "googlesearch-python>=1.3.0".
+                    # The import is "from googlesearch import search as google_search_scraper"
+                    # Standard usage: search("query", advanced=True) returns objects with title/description in recent versions?
+                    # Let's assume standard usage for safety: search(query, num_results=k, advanced=True)
+                    
+                    # Check if 'advanced' parameter is supported (it is in googlesearch-python)
+                    # If it's the old 'google' library, it only returns URLs.
+                    # The requirement said 'googlesearch-python', so it supports advanced=True.
+                    
+                    g_results = google_search_scraper(current_q, num_results=k, advanced=True)
+                    for r in g_results:
+                        results.append({
+                            "title": r.title,
+                            "summary": r.description,
+                            "url": r.url
+                        })
+                    
+                    if results:
+                        results = _filter_search_results(results)
+                        results = _rerank_search_results(results, query, k)
+                        return json.dumps({"source": "google-scraper", "results": results}, ensure_ascii=False)
+                except Exception as e:
+                    print(f"[Monitoring] Google Scraper error: {e}")
 
             if brave_key:
                 try:
@@ -596,6 +683,40 @@ def web_fetch(url: str, max_bytes: int = 200_000) -> str:
 
         path_lower = (parsed.path or "").lower()
         
+        # === Jina Reader 优先策略 ===
+        # 排除 Wikipedia (API已经很稳定) 和 PDF
+        if "wikipedia.org" not in parsed.netloc and not url.lower().endswith(".pdf"):
+            try:
+                session = get_session()
+                jina_content = _fetch_with_jina(url, session)
+                
+                if jina_content:
+                    print(f"[WebFetch] Jina Reader success for {url}")
+                    # 缓存成功的fetch结果
+                    try:
+                        result = json.dumps({
+                            "source": url, 
+                            "content": jina_content[:15000], 
+                            "type": "jina_markdown"
+                        }, ensure_ascii=False)
+                        _URL_FETCH_CACHE[normalized_url] = (result, time.time())
+                        if len(_URL_FETCH_CACHE) > _URL_FETCH_LIMIT:
+                            oldest_key = min(_URL_FETCH_CACHE.keys(), key=lambda k: _URL_FETCH_CACHE[k][1])
+                            del _URL_FETCH_CACHE[oldest_key]
+                    except Exception:
+                        pass
+
+                    return json.dumps({
+                        "source": url, 
+                        "content": jina_content[:15000], 
+                        "type": "jina_markdown"
+                    }, ensure_ascii=False)
+                else:
+                    print(f"[WebFetch] Jina Reader failed/skipped, falling back to standard fetch...")
+            except Exception as e_jina:
+                print(f"[WebFetch] Jina Error: {e_jina}, falling back...")
+        # ===========================
+
         if path_lower.endswith(".pdf") or url.lower().endswith(".pdf"):
             try:
                 content = None
@@ -644,7 +765,25 @@ def web_fetch(url: str, max_bytes: int = 200_000) -> str:
                      return json.dumps({"error": "pdf_parse_error", "message": str(e)}, ensure_ascii=False)
 
             except Exception as e:
-                print(f"[Warn] PDF processing failed: {e}")
+                print(f"[Warn] PDF processing failed: {e}. Attempting Snippet Fallback.")
+                try:
+                    fallback_res = web_search(url, top_k=1)
+                    fallback_data = json.loads(fallback_res)
+                    if "results" in fallback_data and fallback_data["results"]:
+                        first = fallback_data["results"][0]
+                        snippet = first.get("summary") or first.get("snippet") or ""
+                        title = first.get("title") or ""
+                        if snippet:
+                             return json.dumps({
+                                "source": url,
+                                "content": f"Title: {title}\nSnippet: {snippet}\n\n[System Note]: PDF download failed. This is the search snippet.",
+                                "type": "snippet_fallback"
+                            }, ensure_ascii=False)
+                except Exception as e_fallback:
+                    print(f"[Warn] PDF Fallback failed: {e_fallback}")
+                
+                # If fallback failed, just return error
+                return json.dumps({"error": "pdf_failed", "message": str(e)}, ensure_ascii=False)
 
         if "wikipedia.org" in parsed.netloc:
              wiki_res = _fetch_wikipedia_rest(url)
@@ -717,6 +856,25 @@ def web_fetch(url: str, max_bytes: int = 200_000) -> str:
         except Exception as e:
             # 不再手动管理黑名单，由智能请求器自动处理
             print(f"[Monitoring] Fetch failed ({e}), attempting Snippet Fallback for {url}...")
+            
+            # Helper to extract text from URL
+            def _extract_text_from_url(u: str) -> str:
+                from urllib.parse import urlparse, unquote
+                try:
+                    parsed = urlparse(u)
+                    path = unquote(parsed.path)
+                    # Replace separators
+                    text = path.replace("-", " ").replace("_", " ").replace("/", " ")
+                    # Simple filter
+                    words = [w for w in text.split() if len(w) > 2 and not w.isdigit()]
+                    return " ".join(words)
+                except:
+                    return ""
+
+            url_text = _extract_text_from_url(url)
+            fallback_content = ""
+            fallback_title = ""
+
             try:
                 fallback_res = web_search(url, top_k=1)
                 fallback_data = json.loads(fallback_res)
@@ -725,13 +883,26 @@ def web_fetch(url: str, max_bytes: int = 200_000) -> str:
                     snippet = first.get("summary") or first.get("snippet") or ""
                     title = first.get("title") or ""
                     if snippet:
-                        return json.dumps({
-                            "source": url,
-                            "content": f"Title: {title}\nSnippet: {snippet}\n\n[System Note]: Full content fetch failed. This is the search snippet.",
-                            "type": "snippet_fallback"
-                        }, ensure_ascii=False)
+                        fallback_content = f"Title: {title}\nSnippet: {snippet}"
+                        fallback_title = title
             except Exception as e2:
                 print(f"[Monitoring] Snippet Fallback failed: {e2}")
+            
+            # Combine results
+            final_content = ""
+            if fallback_content:
+                final_content = f"{fallback_content}\n\n[System Note]: Full content fetch failed. Above is the search snippet."
+            
+            # Append URL semantic text if available
+            if url_text and len(url_text) > 10:
+                 final_content += f"\n\n[System Note]: Extracted keywords from URL path (HIGH VALUE):\n{url_text}"
+
+            if final_content:
+                return json.dumps({
+                    "source": url,
+                    "content": final_content,
+                    "type": "snippet_fallback"
+                }, ensure_ascii=False)
             
             return json.dumps({"error": "fetch_failed", "message": str(e)}, ensure_ascii=False)
     except Exception as e:
@@ -857,112 +1028,6 @@ def browse_pdf_attachment(url: str, instructions: str, max_pages: int = 6) -> st
     except Exception as e:
         return json.dumps({"error": "browse_pdf_failed", "message": str(e)}, ensure_ascii=False)
 
-def multi_hop_search(query: str, max_hops: int = 3) -> str:
-    try:
-        print(f"[Monitoring] multi_hop_search query='{query}'")
-        
-        slots = _extract_search_slots(query)
-        print(f"[Monitoring] extracted_slots: {slots}")
-        
-        target_type = slots.get("type", "Other")
-        target_country = slots.get("target_country")
-        hard_constraints = slots.get("hard_constraints", [])
-        
-        if target_type in ["Person", "Organization"] and target_country:
-            role = slots.get('hard_constraints')[0] if hard_constraints else 'leaders'
-            list_query = f"List of {role} of {target_country}"
-            
-            for c in hard_constraints:
-                if any(char.isdigit() for char in c): 
-                    list_query += f" {c}"
-            
-            print(f"[Monitoring] Strategy: List-then-Filter. Query: '{list_query}'")
-            
-            list_res = web_search(list_query, top_k=5)
-            list_data = json.loads(list_res)
-            
-            candidates = []
-            if "results" in list_data:
-                client = get_llm_client()
-                prompt = [
-                    {"role": "system", "content": "Extract a list of candidate names from the search results. Return JSON list."},
-                    {"role": "user", "content": f"Search Results: {str(list_data['results'])[:4000]}"}
-                ]
-                try:
-                    cand_resp = client.chat.completions.create(model="qwen3-max", messages=prompt, response_format={"type": "json_object"})
-                    candidates = json.loads(cand_resp.choices[0].message.content).get("names", [])
-                except:
-                    pass
-            
-            if candidates:
-                print(f"[Monitoring] Verifying {len(candidates)} candidates against constraints: {hard_constraints} + {slots.get('soft_constraints')}")
-                best_cand = None
-                verification_log = []
-                
-                soft_constraints = slots.get("soft_constraints", [])
-                all_constraints = hard_constraints + soft_constraints
-                
-                for cand in candidates[:5]: 
-                    verify_q = f'"{cand}" ' + " ".join(all_constraints[:3])
-                    v_res = web_search(verify_q, top_k=3)
-                    v_data = json.loads(v_res)
-                    results = v_data.get("results", [])
-                    
-                    score = 0
-                    combined_text = " ".join([r.get("title", "") + " " + r.get("summary", "") for r in results]).lower()
-                    
-                    matches = []
-                    for c in all_constraints:
-                        if c.lower() in combined_text:
-                            score += 1
-                            matches.append(c)
-                    
-                    if "scandal" in str(slots).lower() or "corruption" in str(slots).lower():
-                         if "scandal" in combined_text or "corruption" in combined_text or "arrested" in combined_text:
-                             score += 1
-                             matches.append("scandal/corruption")
-                    
-                    verification_log.append(f"{cand}: score={score} matches={matches}")
-                    
-                    if score >= 1: 
-                         best_cand = cand
-                         if score >= len(all_constraints):
-                             break
-                
-                return json.dumps({
-                    "source": "multi_hop_strategy_list",
-                    "candidates": candidates[:5],
-                    "best_candidate_found": best_cand,
-                    "verification_log": verification_log,
-                    "strategy": "list_then_filter",
-                    "original_slots": slots,
-                    "recommendation": f"Focus on {best_cand} if found, otherwise check candidates."
-                }, ensure_ascii=False)
-
-        search_hops = []
-        anchors = slots.get("anchors", [])
-        if not anchors:
-            anchors = _extract_core_entities(query)[:3]
-            
-        hop1_query = " ".join(anchors) if anchors else query
-        
-        search_hops.append({
-                'hop': 1,
-                'purpose': 'identify_entity',
-                'query': hop1_query,
-                'strategy': 'anchor_keywords'
-            })
-            
-        res = web_search(hop1_query, top_k=5)
-        return json.dumps({
-            "source": "multi_hop_fallback",
-            "slots": slots,
-            "results": json.loads(res).get("results", []),
-            "recommendation": "Use slots to verify these results."
-        }, ensure_ascii=False)
-
-    except Exception as e:
-        return json.dumps({"error": "multi_hop_failed", "message": str(e)}, ensure_ascii=False)
 
 def get_weather(location: str) -> str:
     return f"The weather of {location} is sunny."

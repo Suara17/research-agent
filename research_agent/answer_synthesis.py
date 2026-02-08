@@ -4,8 +4,12 @@
 """
 import json
 import re
+import logging
 from typing import Dict, List, Optional, Tuple
 from .utils import get_llm_client
+from .sensitive_filter import sanitize_text_for_llm, is_content_inspection_error, simplify_query_on_failure
+
+logger = logging.getLogger(__name__)
 
 
 def verify_entity_relationships(
@@ -112,6 +116,7 @@ def extract_candidate_answers(
 ) -> List[Dict]:
     """
     从搜索结果和工具结果中提取候选答案
+    注意：此阶段使用过滤后的敏感词，避免触发内容审核
 
     Args:
         question: 原始问题
@@ -121,26 +126,42 @@ def extract_candidate_answers(
     Returns:
         候选答案列表 [{answer, confidence, evidence}]
     """
-    try:
-        client = get_llm_client(timeout=30.0)
+    max_retries = 3
 
-        # 整合上下文
-        context = "搜索结果摘要:\n"
-        for i, result in enumerate(search_results[:10]):
-            title = result.get("title", "")
-            summary = result.get("summary") or result.get("snippet", "")
-            context += f"{i+1}. {title}: {summary[:200]}\n"
+    for attempt in range(max_retries):
+        try:
+            client = get_llm_client(timeout=30.0)
 
-        context += "\n工具调用结果摘要:\n"
-        for i, result in enumerate(tool_results[-5:]):
-            context += f"{i+1}. {result[:300]}\n"
+            # 整合上下文
+            context = "搜索结果摘要:\n"
+            for i, result in enumerate(search_results[:10]):
+                title = result.get("title", "")
+                summary = result.get("summary") or result.get("snippet", "")
+                context += f"{i+1}. {title}: {summary[:200]}\n"
 
-        prompt = f"""基于以下信息，提取问题的候选答案。
+            context += "\n工具调用结果摘要:\n"
+            for i, result in enumerate(tool_results[-5:]):
+                context += f"{i+1}. {result[:300]}\n"
 
-问题: {question}
+            # 【关键】仅在发送给LLM前过滤敏感词
+            sanitized_question, q_replacements = sanitize_text_for_llm(
+                question,
+                log_replacement=(attempt == 0)
+            )
+            sanitized_context, c_replacements = sanitize_text_for_llm(
+                context[:3000],
+                log_replacement=(attempt == 0)
+            )
+
+            if attempt == 0 and (q_replacements or c_replacements):
+                logger.info(f"[AnswerSynthesis] 候选提取阶段过滤敏感词: 问题{len(q_replacements)}处, 上下文{len(c_replacements)}处")
+
+            prompt = f"""基于以下信息，提取问题的候选答案。
+
+问题: {sanitized_question}
 
 信息来源:
-{context[:3000]}
+{sanitized_context}
 
 请输出JSON格式:
 {{
@@ -159,22 +180,37 @@ def extract_candidate_answers(
 2. confidence范围0-1，表示置信度
 3. evidence列出支持该答案的关键证据
 4. 按confidence降序排列
+5. 答案字段("answer")必须仅包含实体名称，禁止包含任何状态标注(如"(未找到)", "(not found)", "未检索到"等)。
 """
 
-        response = client.chat.completions.create(
-            model="qwen3-max",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=800,
-            response_format={"type": "json_object"}
-        )
+            response = client.chat.completions.create(
+                model="qwen3-max",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=800,
+                response_format={"type": "json_object"}
+            )
 
-        result = json.loads(response.choices[0].message.content)
-        return result.get("candidates", [])
+            result = json.loads(response.choices[0].message.content)
+            return result.get("candidates", [])
 
-    except Exception as e:
-        print(f"[AnswerSynthesis] 候选答案提取失败: {e}")
-        return []
+        except Exception as e:
+            if is_content_inspection_error(e):
+                logger.warning(f"[AnswerSynthesis] 候选提取触发内容审核 (尝试 {attempt+1}/{max_retries})")
+
+                if attempt < max_retries - 1:
+                    # 简化问题并重试
+                    question = simplify_query_on_failure(question, attempt)
+                    context = simplify_query_on_failure(context[:3000], attempt)
+                    logger.info(f"[AnswerSynthesis] 简化后重试...")
+                    continue
+                else:
+                    logger.error(f"[AnswerSynthesis] 候选提取失败，已达最大重试次数")
+
+            logger.error(f"[AnswerSynthesis] 候选答案提取失败: {e}")
+            return []
+
+    return []
 
 
 def synthesize_final_answer(
@@ -235,8 +271,9 @@ def synthesize_final_answer(
 
 要求:
 1. 必须从候选答案中选择一个作为最终答案(不允许回答"不确定")
-2. 如果实体关系图显示逻辑冲突，优先选择逻辑一致的候选
-3. 确保答案格式符合问题要求(年份/姓名/地名等)
+2. 严禁在答案后附加任何免责声明(如"未检索到明确答案", "not found", "uncertain")。只输出实体名称。
+3. 如果实体关系图显示逻辑冲突，优先选择逻辑一致的候选
+4. 确保答案格式符合问题要求(年份/姓名/地名等)
 """
 
         response = client.chat.completions.create(

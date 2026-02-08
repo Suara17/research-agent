@@ -16,6 +16,7 @@ class DomainStatus:
 
     def __init__(self):
         self.status_cache: Dict[str, Dict[str, Any]] = {}
+        self.blocked_urls: Dict[str, float] = {}  # URL级别封禁 (url -> timestamp)
         self.cooldown_period = 300  # 5分钟冷却期
 
     def is_blocked(self, domain: str) -> bool:
@@ -31,8 +32,22 @@ class DomainStatus:
 
         return False
 
+    def is_url_blocked(self, url: str) -> bool:
+        """检查特定URL是否被封禁（用于404等页面级错误）"""
+        if url in self.blocked_urls:
+            if time.time() - self.blocked_urls[url] < self.cooldown_period:
+                return True
+            else:
+                del self.blocked_urls[url]
+        return False
+
+    def mark_url_failed(self, url: str, reason: str):
+        """标记特定URL为失败（不封禁整个域名）"""
+        self.blocked_urls[url] = time.time()
+        logger.info(f"URL marked as failed (not domain-level): {url} - {reason}")
+
     def mark_unreachable(self, domain: str, reason: str, error_type: str):
-        """标记域名为不可达"""
+        """标记域名为不可达（仅用于真正的域名级错误：DNS/SSL/连接拒绝）"""
         self.status_cache[domain] = {
             'state': 'unreachable',
             'last_failure': time.time(),
@@ -50,21 +65,33 @@ class DomainStatus:
 
     def get_recommended_timeout(self, domain: str, attempt: int) -> int:
         """获取推荐的超时时间"""
+        # 已知快速域名使用更短超时
+        fast_domains = {
+            'en.wikipedia.org', 'zh.wikipedia.org', 'ja.wikipedia.org',
+            'www.wikidata.org', 'api.wikipedia.org',
+        }
+        if domain in fast_domains:
+            return 5
+
         # 首次尝试：5秒快速失败
-        # 后续尝试：逐渐增加
+        # 后续尝试：逐渐增加，最多10秒
         base_timeout = 5
-        return min(base_timeout + attempt * 5, 15)  # 最多15秒
+        return min(base_timeout + attempt * 3, 10)
 
 
 class ErrorClassifier:
     """错误分类器"""
 
-    # 永久性错误：立即放弃
+    # 永久性错误：立即放弃（仅限域名级错误）
     PERMANENT_ERRORS = {
         'SSLError': 'SSL握手失败',
         'SSLEOFError': 'SSL连接中断',
         'NameResolutionError': 'DNS解析失败',
         'ConnectionRefusedError': '连接被拒绝',
+    }
+
+    # 页面级错误：不应封禁域名，只标记该URL
+    PAGE_LEVEL_ERRORS = {
         '404': '页面不存在',
         '403': '禁止访问',
         '401': '需要认证',
@@ -89,14 +116,20 @@ class ErrorClassifier:
         分类错误类型
 
         Returns:
-            'PERMANENT': 永久性错误，不应重试
+            'PERMANENT': 永久性域名级错误，不应重试，封禁域名
+            'PAGE_LEVEL': 页面级错误（404/403等），不封禁域名
             'TRANSIENT': 暂时性错误，可以重试
             'UNKNOWN': 未知错误
         """
         error_str = str(exception)
         error_class = exception.__class__.__name__
 
-        # 检查永久性错误
+        # 检查页面级错误（优先于永久性错误判定）
+        for keyword in cls.PAGE_LEVEL_ERRORS.keys():
+            if keyword in error_class or keyword in error_str:
+                return 'PAGE_LEVEL'
+
+        # 检查永久性错误（域名级）
         for keyword in cls.PERMANENT_ERRORS.keys():
             if keyword in error_class or keyword in error_str:
                 return 'PERMANENT'
@@ -112,6 +145,11 @@ class ErrorClassifier:
     def get_error_description(cls, exception: Exception) -> str:
         """获取错误的友好描述"""
         error_class = exception.__class__.__name__
+
+        # 检查页面级错误
+        for keyword, description in cls.PAGE_LEVEL_ERRORS.items():
+            if keyword in error_class or keyword in str(exception):
+                return description
 
         # 先检查永久性错误
         for keyword, description in cls.PERMANENT_ERRORS.items():
@@ -171,6 +209,10 @@ class IntelligentFetcher:
         Returns:
             (should_fetch, skip_reason)
         """
+        # 先检查URL级别封禁
+        if self.domain_status.is_url_blocked(url):
+            return False, f"URL blocked (page-level error)"
+
         domain = urlparse(url).netloc
 
         if self.domain_status.is_blocked(domain):
@@ -225,8 +267,13 @@ class IntelligentFetcher:
 
                 logger.info(f"Fetch error for {url}: {error_desc} (type={error_type})")
 
-                # 永久性错误 → 立即放弃
-                if error_type == 'PERMANENT':
+                # 页面级错误（404/403等）→ 只封禁该URL，不封禁域名
+                if error_type == 'PAGE_LEVEL':
+                    self.domain_status.mark_url_failed(url, str(e))
+                    return None, f"Page-level error: {error_desc}"
+
+                # 永久性域名级错误 → 封禁域名
+                elif error_type == 'PERMANENT':
                     self.domain_status.mark_unreachable(domain, str(e), error_type)
                     return None, f"Permanent error: {error_desc}"
 

@@ -28,21 +28,25 @@ class ReflectionManager:
             "prompt_template": """
 🔍 **早期概念验证检查点** (步骤 {current_step}/{max_steps})
 
+**最近搜索结果摘要**:
+{recent_snippets_summary}
+
 请回答以下问题来验证你的理解：
 
-1. **问题类型识别**：这个问题要求的答案类型是什么？（人名/地名/年份/数字/组织名等）
+1. **搜索结果反馈**：
+   - 你的搜索结果是否包含你期望的信息？如果全是无关内容，说明你的**关键词选择**或**概念理解**可能有误。
 
-2. **核心概念理解**：问题中是否有专业术语？你是否确认理解正确？
+2. **问题类型识别**：这个问题要求的答案类型是什么？（人名/地名/年份/数字/组织名等）
+
+3. **核心概念理解**：问题中是否有专业术语？你是否确认理解正确？
    - 例如："five-star accredited" 可能指什么？（博物馆评级？体育场评级？酒店评级？）
    - 如果不确定，列出可能的解释
 
-3. **搜索方向检查**：你目前的搜索关键词是：{recent_keywords}
+4. **搜索方向检查**：你目前的搜索关键词是：{recent_keywords}
    - 这些关键词是否直接针对问题的核心要素？
    - 是否存在概念误解导致搜索方向错误？
 
-4. **已获取信息盘点**：到目前为止，你已经找到哪些关键事实？还缺少什么？
-
-⚠️ **强制要求**：如果发现概念理解有误，立即调整搜索策略。
+⚠️ **强制要求**：如果搜索结果显示你找错了方向（例如搜"Rio Bravo"出来的是电影而不是博物馆），立即**停止**并调整搜索词（例如增加限定词 "museum" 或 "collection"）。
 """
         },
 
@@ -55,51 +59,55 @@ class ReflectionManager:
 
 你已经进行了 {search_count} 次搜索。现在需要整合信息：
 
-1. **实体关系梳理**：列出你识别到的所有关键实体及其关系
+**最近搜索结果摘要 (Evidence Snippets)**:
+{recent_snippets_summary}
+
+1. **证据有效性分析**：
+   - 仔细检查上面的搜索结果片段，它们是否包含了回答问题所需的**具体细节**？
+   - 还是仅仅是通用介绍或不相关的噪音？如果是噪音，**为什么**你的搜索词会引出这些结果？
+
+2. **实体关系梳理**：列出你识别到的所有关键实体及其关系
    - 例如：A位于B，C与D合作，E由F资助
    - 是否存在逻辑矛盾？（如：X在Y，但又要求X不在Y）
 
-2. **信息缺口识别**：基于问题要求，你还缺少哪些关键信息？
+3. **信息缺口识别**：基于问题要求，你还缺少哪些关键信息？
    - 优先级排序：哪些是回答问题必须的？哪些是次要的？
 
-3. **搜索效率评估**：
+4. **搜索效率评估**：
    - 最近5次搜索是否都在重复相似的查询？
    - 是否陷入"信息孤岛"（找到片段信息但未建立联系）？
 
-4. **策略调整建议**：
-   - 如果信息分散，是否需要搜索"X和Y的关系"？
+5. **策略调整建议 (CRITICAL)**：
+   - 如果搜索结果全是无关信息，**立即换一个思路**（例如：从查找"谁"改为查找"事件"）。
+   - 不要死磕同一个关键词。如果 "X" 搜不到，尝试搜 "X的关联实体"。
    - 如果某个实体信息不足，是否需要直接搜索该实体的官方信息？
 
-💡 **提示**：复杂问题通常需要将多个独立事实组合成完整推理链。
+💡 **提示**：复杂问题通常需要将多个独立事实组合成完整推理链。如果陷入僵局，请尝试完全不同的搜索方向。
 """
         },
 
-        # 后期答案验证 (约 75% 进度)
+        # 后期答案验证 (约 75% 进度) - 紧急收敛模式
         {
             "phase": "late",
             "trigger_condition": "always",
             "prompt_template": """
-✅ **后期答案验证检查点** (步骤 {current_step}/{max_steps})
+⚠️ **STEP LIMIT WARNING** (Step {current_step}/{max_steps})
 
-你已经搜索了 {search_count} 次。如果你已有候选答案，请验证：
+You are approaching the maximum step limit. You have limited steps remaining.
+**STRATEGY UPDATE: CONVERGENCE MODE**
 
-1. **完整性验证**：候选答案是否满足问题的所有约束条件？
-   - 列出问题中的每个约束，逐一确认
+1. **STOP EXPLORING** new paths or entities unless absolutely necessary.
+2. **SYNTHESIZE** the information you have gathered so far.
+3. **DECIDE** on the best possible answer now.
+   - If you have a strong candidate, verify it one last time and output 'Final Answer'.
+   - If you are still uncertain, choose the most likely hypothesis based on available evidence. **Better to answer with confidence than to run out of steps.**
 
-2. **证据链验证**：你的推理过程是否基于确凿证据？
-   - 列出支持答案的3个最强证据
-   - 是否存在矛盾证据？
+**Checklist for Final Answer**:
+- Does it directly answer the user's question?
+- Is the language consistent with the question?
+- Are constraints (Year, Location, Type) satisfied?
 
-3. **答案类型匹配**：
-   - 问题要求的答案格式是什么？（年份/全名/英文名/数字等）
-   - 你的答案格式是否匹配？
-
-4. **替代可能性排除**：是否还有其他候选答案？
-   - 如果有，为什么选择当前答案而非其他？
-
-如果答案仍不明确，建议：
-- 搜索"候选答案 + 验证性关键词"来确认
-- 使用multi-source-verify技能进行多源交叉验证
+**ACTION**: Provide your 'Final Answer' within the next 2-3 steps.
 """
         }
     ]
@@ -169,12 +177,28 @@ class ReflectionManager:
         Returns:
             格式化的反思提示
         """
-        return checkpoint_template["prompt_template"].format(
-            current_step=context.get("current_step", 0),
-            max_steps=context.get("max_steps", 40),
-            search_count=context.get("search_count", 0),
-            recent_keywords=", ".join(context.get("recent_keywords", [])[-5:])
-        )
+        recent_snippets = context.get("recent_snippets", [])
+        snippets_summary = ""
+        if recent_snippets:
+            snippets_summary = "\n".join([f"- {s[:150]}..." for s in recent_snippets[:3]])
+        else:
+            snippets_summary = "(No recent search results available)"
+
+        # Prepare arguments safely
+        format_args = {
+            "current_step": context.get("current_step", 0),
+            "max_steps": context.get("max_steps", 40),
+            "search_count": context.get("search_count", 0),
+            "recent_keywords": ", ".join(context.get("recent_keywords", [])[-5:]),
+            "recent_snippets_summary": snippets_summary
+        }
+
+        # Handle templates that might not have {recent_snippets_summary}
+        # We can't easily inspect the string for keys without regex, 
+        # but passing extra args to .format() is generally safe in Python if we unpack kwargs? 
+        # No, str.format(**kwargs) works fine.
+        
+        return checkpoint_template["prompt_template"].format(**format_args)
 
 
 class ConceptVerifier:

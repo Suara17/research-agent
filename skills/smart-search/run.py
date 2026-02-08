@@ -39,10 +39,15 @@ def _load_env():
         pass
 
 def _get_client():
-    api_key = os.environ.get("IFLOW_API_KEY")
-    if not api_key:
-        return None
-    return OpenAI(base_url="https://apis.iflow.cn/v1", api_key=api_key, timeout=15.0)
+    """Get LLM client"""
+    # Add project root to sys.path to ensure we can import research_agent
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(os.path.dirname(current_dir))
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    
+    from research_agent.utils import get_llm_client
+    return get_llm_client(timeout=15.0)
 
 def _analyze_query_with_llm(query: str, original_entities: list, excluded_entities: list = [], feedback: str = "") -> dict:
     """
@@ -58,77 +63,49 @@ def _analyze_query_with_llm(query: str, original_entities: list, excluded_entiti
     if not client:
         return None
 
-    # 🔥 优化后的 Prompt：分层搜索 + 权威来源优先 + 硬约束前置
+    # 🔥 优化后的 Prompt：分层搜索 + HyDE (Hypothetical Document Embeddings) + 权威来源
     prompt = f"""You are a Search Engine Optimization Expert with expertise in hierarchical verification strategies.
-Analyze the user query and generate TARGETED search queries with authoritative source prioritization.
+Analyze the user query and generate TARGETED search queries.
 
 User Query: "{query}"
 Known Entities: {json.dumps(original_entities, ensure_ascii=False)}
 Excluded Entities: {json.dumps(excluded_entities, ensure_ascii=False)} (MUST be excluded)
-Previous Feedback/Failure Context: "{feedback}" (CRITICAL: Adjust queries to address this feedback)
+Previous Feedback/Failure Context: "{feedback}"
 
 Analysis Tasks:
-1. **Identify Intent**: Is it looking for a specific person, checking a fact, solving a riddle, or **Resolving a Conflict** (e.g. "A is at B but not in B's city")?
-2. **Extract Constraints (CRITICAL)**: 
-   - **Hard Constraints**: Dates (e.g., "1990s", "2024"), Legal Terms ("Constitution", "Amendment"), Locations ("Southern Europe"), Roles ("Head of Government" vs "Head of State").
-   - **Soft Constraints**: Themes ("Scandal", "Corruption"), Attributes ("Studied abroad", "Relatives").
-   - **Negative/Relational Constraints**: "Not situated in that city", "Outside the capital", "Partner of".
-   - ⚠️ STRATEGY: You MUST generate queries that combine Hard Constraints to narrow the field BEFORE adding Soft Constraints.
+1. **Identify Intent**: Is it a specific person search, fact check, or **RIDDLE/VAGUE** description?
 
-3. **Cross-Lingual**: If the topic implies a non-English country (e.g., Mongolia, Japan), generate queries in English AND that specific language context.
-   - Analyze the CONTENT constraints (e.g., "1990s constitution", "mineral corruption") to infer the correct region.
-   
-4. **🔥 HIERARCHICAL SEARCH STRATEGY (CRITICAL)** - Generate queries in this priority order:
+2. **Riddle & Category Strategy (CRITICAL)**:
+   - If the query mentions a generic **CATEGORY** (e.g. "a unit of power", "a chemical element") instead of a specific name, you MUST generate a query to **LIST** that category.
+   - Example: Query "Writer named same as power unit" -> Query "List of power units", "List of writers with names matching power units".
+   - **DO NOT** just guess one instance (e.g. do not just search "Watt" unless explicitly asked).
 
-   **A. Hard Constraint Filtering (First Pass)**:
-      - Combine Date + Legal/Formal Term + Broad Region/Category.
-      - Example: "Constitution enacted 1990-1995 amended 2017-2019 head of state powers" (No soft constraints yet).
-      - Example: "List of Prime Ministers appointed by Head of State in [Region]"
+3. **HyDE Strategy (Hypothetical Document Embeddings)**:
+   - If the query is a **RIDDLE** or uses **VAGUE** descriptions (e.g. "A department...", "A major country...", "An event in 1990s"), you MUST imagine what the **Official News Headline** or **Report Title** would be.
+   - Example: Query "A wealth management department investigated..." -> HyDE: "FINRA investigates wealth management division 2025" or "SEC charges bank wealth unit".
+   - **Action**: Generate 1-2 hypothetical titles to search.
 
-   **B. For Education/Background Verification**:
-      Priority 1: "Person Name" + university + site:edu (e.g., "John Doe site:harvard.edu alumni")
-      Priority 2: site:linkedin.com "Person Name" education
-      Priority 3: "Person Name" + parliament/government + site:.gov biography
+4. **Structured Query Generation (3 Categories)**:
+   - **A. Broad/Context Queries**: Search for lists, overviews, or broad events (e.g. "List of ...", "... scandal overview").
+   - **B. Precise/Authoritative Queries**: Use `site:.gov`, `site:.edu`, `site:reuters.com` with specific hard constraints (Year, Location).
+   - **C. Negative/Exclusion Queries**: If 'Excluded Entities' are provided or Feedback mentions a wrong path, explicitly exclude them (e.g. "-Bitcoin").
 
-   **C. For Scandal/Corruption Verification**:
-      Priority 1: "Person Name" + scandal + site:reuters.com OR site:bbc.com (authoritative news)
-      Priority 2: "Person Name" + relatives + assets + investigation
-
-   **D. For Conflict/Riddle Resolution (Spatial/Logic)**:
-      - If query implies "A at B but not in B's city": Search for "A location vs B location", "A branches", "A partnership B", "A history original location".
-      - Example: "Museum A location" AND "Venue B location" (Separate queries to verify mismatch).
-      - Query: "List of partners of Venue B" 
-
-   **E. General Strategy** (for any "Who is..." questions):
-      Query 1: "List of..." (CRITICAL to prevent premature convergence)
-      Query 2: Hard Constraints ONLY (to find the right country/context)
-      Query 3: Full detailed query
-
-5. **🔥 AUTHORITATIVE SOURCE PRIORITY**:
-   - Education Background: site:.edu > site:linkedin.com > site:parliament.gov > general news
-   - Historical Events: site:wikipedia.org > site:.gov > site:.edu > general news
-   - Scandal/Corruption: site:reuters.com OR site:bbc.com > local investigative journalism
-
-   IMPORTANT: Place site: filters at the BEGINNING of queries for better search precision.
-
-6. **Negative Constraints (Postponed)**: Append exclusion terms at the END of queries to avoid over-filtering.
-   Format: "main query keywords site:authoritative.source -ExcludedEntity1 -ExcludedEntity2"
-
-7. **Feedback Adaptation**: If 'Previous Feedback' is provided, you MUST generate queries that specifically target the missing information.
+4. **Cross-Lingual (MANDATORY)**:
+   - If the entity or topic is associated with a specific country (e.g. "Tencent" -> China, "Nintendo" -> Japan, "Volkswagen" -> Germany), you **MUST** generate queries in that country's NATIVE language.
+   - Example: "Tencent game" -> Generate "腾讯 游戏" (Chinese).
+   - Example: "Anime about..." -> Generate "动漫 ..." (Japanese).
+   - **Do not rely on English only for local entities.**
 
 Output JSON format ONLY:
 {{
     "intent": "string",
-    "primary_language_of_topic": "string (e.g., English, Chinese, Mongolian)",
     "extracted_keywords": ["str"],
-    "hard_constraints": ["str"],
-    "verification_focus": "string",
     "generated_queries": [
-        "Priority 1: Hard Constraint Filter Query",
-        "Priority 2: Authoritative Verification Query",
-        "List generation query",
-        "Precise keyword query -exclude",
-        "Cross-lingual query (if applicable) -exclude"
+        "HyDE: Hypothetical Headline 1",
+        "Broad: List of ...",
+        "Precise: ... site:...",
+        "Native: [Chinese/Japanese/etc] query...",
+        "Negative: ... -excluded"
     ]
 }}
 """
