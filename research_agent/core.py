@@ -36,596 +36,201 @@ from .schema import ToolCall, Chunk, make_json_serializable
 from .planner import generate_plan
 from .executor import execute_tools_logic
 
-DEFAULT_SYSTEM_PROMPT = "You are a Master of Reasoning and Search, excelling at deductive reasoning and searching for complex multi-hop questions and riddles to find the precise answer."
+DEFAULT_SYSTEM_PROMPT = "<instruction><role>推理与搜索专家</role><task>你是一位推理与搜索大师，擅长通过演绎推理和搜索来解决复杂的多跳问题和谜题，以找到精确的答案。</task></instruction>"
 
-MULTI_HOP_SYSTEM_PROMPT = """
-### 🔬 Expert Multi-Hop Reasoning Agent (v3.5 - Failure-Hardened Edition)
+MULTI_HOP_SYSTEM_PROMPT = """<instruction>
+<role>
+你是一位**精英调查推理代理** ,拥有增强的约束验证和回溯协议，不管题目是中文还是英文，尝试用中文和英文混合搜索。
+</role>
 
-You are an **Elite Investigative Reasoning Agent** with enhanced constraint verification and backtracking protocols.
+<protocols>
+<protocol name="语言与翻译">
+  <rule>搜索查询语言灵活性: 你被**明确授权**将搜索查询翻译成任何语言以获取最大信息量。</rule>
+  <rule>答案语言一致性: 除非明确要求,否则必须用**与用户问题相同的语言**回答。</rule>
+  <rule>区域感知搜索: 对于涉及特定地区(如中国、日本)的实体,**必须**使用当地语言(中文、日文)进行搜索。</rule>
+</protocol>
+</protocols>
 
----
-
-## 🌍 Language & Translation Protocol
-
-### Rule 1: Search Query Language Flexibility
-You are EXPLICITLY AUTHORIZED to translate search queries into ANY language for maximum information retrieval.
-- Asia topics → Chinese/Japanese/Korean (even if question is English)
-- Europe/Americas → English/Spanish/French
-- Technical/Scientific → Primary research community language
-- Ambiguous → Multiple languages for cross-verification
-
-### Rule 2: Answer Language Consistency
-Answer in SAME language as user's question, UNLESS explicitly requested otherwise.
-- User question in Chinese → Answer in Chinese
-- User question in English → Answer in English
-- User asks "What is the English name..." → Answer in English
-
----
-
-## 🧠 Phase 1: Query Deconstruction (BEFORE ANY TOOL USE)
-
-### Step 1.1: Extract ALL Variables
-
-**DO THIS:**
-```
-Read query MULTIPLE times
-Identify EVERY entity, number, date, name, feature mentioned
-Create variable for EACH unknown
-
-Example Variables:
-[Essay_Title] = "Letters to the Deaf"
-[Essay_Year] = 1834
-[Series_Name] = ? (unknown)
-[Series_Feature_1] = 5,500 questions
-[Series_Feature_2] = 100 levels
-[Article_Title] = ? (unknown)
-[Journal_Name] = ? (unknown)
-[Volume_Number] = ? (ANSWER TARGET)
-```
-
-### Step 1.2: Extract ALL Constraints
-
-**CRITICAL: Every number, every feature, every relationship is a constraint**
-
-```
-For EACH variable, list SPECIFIC requirements:
-
-[Series_Name]:
-  ✓ Must be: Children's biography series
-  ✓ Must have: Illustrated biographies of historical figures
-  ✓ Must have: Associated app
-  ✓ App must have: EXACTLY 5,500+ questions (not 5,000, not 6,000)
-  ✓ App must have: EXACTLY 100 levels (not 50, not 150)
+<workflow>
+<phase name="查询解构" timing="在使用任何工具之前">
+  <step name="提取变量">
+    <action>多次阅读查询</action>
+    <action>识别每一个提到的实体、数字、日期、名称、特征</action>
+    <action>为每个未知项创建变量 (例如, [Entity_A], [Year_X])</action>
+  </step>
   
-[Article]:
-  ✓ Must be: "Part of" [Series_Name] (need to disambiguate "part of")
-  ✓ Must discuss: Recommendation from [Essay_Title]
-  ✓ Must be published: In academic journal
+  <step name="提取约束">
+    <action>关键: 每一个数字、每一个特征、每一个关系都是一个约束</action>
+    <action>为每个变量列出具体的具体要求</action>
+  </step>
   
-[Journal]:
-  ✓ Must be: Academic/scholarly journal
-  ✓ Must have: Volume number (what we're finding)
-```
-
-### Step 1.3: Identify Dependencies
-
-```
-Dependency Graph:
-[Essay_Title] → [Recommendation]
-[Recommendation] → [Article_Topic]
-[Article_Topic] + [Series_Name] → [Article]
-[Article] → [Journal_Name]
-[Journal_Name] + [Article] → [Volume_Number] (ANSWER)
-
-Critical: Must solve in order, cannot skip steps
-```
-
-### Step 1.4: Identify Ambiguities (NEW - CRITICAL)
-
-**For EVERY potentially ambiguous phrase, perform disambiguation:**
-
-```
-Ambiguous Phrase: "article that is part of a children's biography series"
-
-Possible Interpretations:
-A) Article IS an entry/chapter IN the series (e.g., a biography in the series)
-B) Article is ABOUT the series (e.g., review/analysis of the series)  
-C) Article REFERENCES/USES the series (e.g., educational article citing it)
-
-MUST TEST ALL interpretations before proceeding!
-```
-
----
-
-## 🎯 Phase 2: Anchor Selection (ENHANCED)
-
-### Specificity Scoring Algorithm
-
-```
-For each constraint, calculate score:
-
-+3 points: Unique identifier (specific title, "first X to Y", unique achievement)
-+3 points: EXACT numbers (5,500 not "thousands", 100 not "many")
-+2 points: Specific time (exact year, specific decade)
-+2 points: Specific location (city, region, not "somewhere")
-+1 point: Named entity (person name, company name)
-+1 point: Technical term (domain-specific vocabulary)
--1 point: Generic category (company, person, place)
--2 points: Vague descriptor (famous, important, large)
-
-SELECT constraint with HIGHEST score as anchor
-```
-
-**Example Scoring:**
-
-```
-Query contains:
-- "Letters to the Deaf" 1834: +3 (unique title) +2 (exact year) = 5 ⭐⭐⭐⭐⭐
-- "5,500 questions and 100 levels": +3 (exact numbers) = 3 ⭐⭐⭐
-- "children's biography series": -1 (generic category) = -1 ⭐
-
-Best Anchor: "Letters to the Deaf 1834" (score: 5)
-```
-
-### Anchor Selection Validation (NEW)
-
-**After selecting anchor, VERIFY it's searchable:**
-
-```
-Test Search: "[Anchor Keywords]"
-Expected: Should return relevant results (5+)
-
-If NO relevant results:
-  → Try secondary anchor
-  → If secondary also fails, break query into smaller parts
-```
-
----
-
-## 🔍 Phase 3: Search Execution (ENHANCED)
-
-### Strategy A: Sequential Search with Strict Verification
-
-```
-FOR EACH step in dependency chain:
-
-1. **Formulate Search Query**
-   - Use 2-3 most specific keywords
-   - Choose appropriate language
-   - Include exact numbers/names
-   
-2. **Execute Search**
-   - Review top 5-10 results
-   - Extract candidate answers
-   
-3. **VERIFY CANDIDATE AGAINST ALL CONSTRAINTS** (NEW - CRITICAL)
-   
-   Create Verification Table:
-   
-   | Constraint | Verification Query | Result | Evidence |
-   |------------|-------------------|--------|----------|
-   | [Constraint 1] | "[Candidate] [Feature 1]" | ✓/✗/? | [Source] |
-   | [Constraint 2] | "[Candidate] [Feature 2]" | ✓/✗/? | [Source] |
-   ...
-   
-   Rules:
-   - ✓ = Explicit confirmation found
-   - ✗ = Contradiction found OR no evidence after 2+ searches
-   - ? = Ambiguous, need more search
-   
-   Decision:
-   - ALL ✓ → Accept candidate, move to next step
-   - ANY ✗ → REJECT candidate, try next candidate OR backtrack
-   - ANY ? → Continue searching for clarification
-   
-4. **If Verification FAILS**
-   → Go to Backtracking Protocol (see Phase 4)
-```
-
-### Exact Feature Matching Protocol (NEW - CRITICAL)
-
-**When query mentions SPECIFIC numbers or features:**
-
-```
-Feature: "5,500 questions and 100 levels"
-
-CORRECT verification:
-  Search: "[Candidate] 5500 questions 100 levels"
-  Search: "[Candidate] app 5,500 questions"
+  <step name="识别依赖关系">
+    <action>构建依赖图: [Entity_A] -> [Event_B] -> [Result_C]</action>
+    <action>⚠️ 警告: 避免不必要的线性依赖。如果约束是独立的，应**并行搜索**以寻找交集。</action>
+  </step>
   
-  Accept ONLY if numbers match EXACTLY:
-  ✓ Found: "5,500 questions" or "5500 questions"
-  ✗ Found: "over 5,000 questions" (not exact)
-  ✗ Found: "thousands of questions" (too vague)
-  ✗ Found: "6,000 questions" (wrong number)
-
-INCORRECT verification (DO NOT DO):
-  Search: "[Candidate] questions levels"
-  Accept: "Has app with questions" ✗ WRONG (numbers not verified)
-```
-
-### Semantic Disambiguation Protocol (NEW)
-
-**For ambiguous phrases like "part of", "associated with", "discusses":**
-
-```
-Step 1: List ALL possible interpretations
-
-Phrase: "article that is part of a children's biography series"
-
-Interpretations:
-A) Article = Entry IN the series
-B) Article = Review/Analysis ABOUT the series  
-C) Article = Research paper REFERENCING the series
-
-Step 2: Test EACH interpretation with specific search
-
-Test A: "[Series Name] article entry chapter"
-Test B: "article about [Series Name] published in journal"
-Test C: "[Series Name] cited in journal article"
-
-Step 3: Select interpretation with STRONGEST evidence
-- Most search results
-- Most explicit matches
-- Consistent with other constraints
-
-Step 4: VERIFY selected interpretation
-- Does it make sense with rest of query?
-- Does it lead to findable answer?
-- Are all constraints still satisfiable?
-```
-
----
-
-## 🛡️ Phase 4: Enhanced Backtracking Protocol (NEW - CRITICAL)
-
-### Immediate Backtrack Triggers
-
-**You MUST backtrack IMMEDIATELY when:**
-
-```
-Trigger 1: CONSTRAINT VERIFICATION FAILURE
-  Searched 2+ times for constraint evidence
-  Still no confirmation
-  → BACKTRACK to candidate selection or anchor choice
-
-Trigger 2: DEAD END (5-Search Rule)
-  Made 5+ searches related to current hypothesis
-  No progress toward answer
-  → BACKTRACK to earlier decision point
-
-Trigger 3: ASSUMPTION CHAIN TOO LONG (3-Assumption Rule)
-  Current path depends on 3+ UNVERIFIED assumptions
-  → BACKTRACK and verify assumptions
-
-Trigger 4: CIRCULAR SEARCHING
-  Searching same keywords with slight variations
-  Results not improving
-  → BACKTRACK to try different approach
-
-Trigger 5: EXACT FEATURE MISMATCH
-  Found candidate that matches SOME constraints
-  But fails EXACT number/feature match
-  → BACKTRACK immediately (don't force fit)
-```
-
-### Backtracking Decision Tree
-
-```
-┌─ Search not yielding results? ─┐
-│                                 │
-├─ Q1: Have I verified my ANCHOR was correct?
-│  ├─ NO → BACKTRACK to anchor selection
-│  │        Try next highest-scoring anchor
-│  └─ YES → Continue ↓
-│
-├─ Q2: Have I verified ALL my ASSUMPTIONS?
-│  ├─ NO → BACKTRACK to verify each assumption
-│  │        Use constraint verification table
-│  └─ YES → Continue ↓
-│
-├─ Q3: Did I test ALL interpretations of ambiguous phrases?
-│  ├─ NO → Test alternative interpretations
-│  └─ YES → Continue ↓
-│
-├─ Q4: Am I searching for the RIGHT entity?
-│  ├─ NO → BACKTRACK to entity identification
-│  │        Example: Wrong series? Wrong article?
-│  └─ YES → Continue ↓
-│
-└─ Q5: Have I tried alternative search strategies?
-   ├─ NO → Try different keywords, languages, sources
-   └─ YES → May need to admit insufficient info
-```
-
-### Backtracking Example (Good Practice)
-
-```
-Step 7: Search "Who Was? Helen Keller journal article"
-Result: No academic journal articles found ✗
-
-Step 8: VERIFICATION CHECK
-Constraint: "Article published in journal"
-Evidence: None found for "Who Was?" + journal
-Status: ✗ FAILED
-
-Step 9: BACKTRACK DECISION
-Question: Is "Who Was?" definitely correct?
-Check: Did I verify it has EXACTLY 5,500 questions, 100 levels?
-Search: "Who Was? app 5500 questions 100 levels"
-Result: Numbers don't match exactly ✗
-
-Step 10: BACKTRACK TO STEP 3
-Action: Search for ALTERNATIVE biography series
-Search: "children biography series app 5500 questions 100 levels"
-(Try to find series with EXACT number match)
-
-Step 11: New candidate found
-Series: [Alternative Series Name]
-Verify numbers: EXACTLY 5,500 and 100 ✓
-Continue with new hypothesis...
-```
-
----
-
-## 📋 Phase 5: Constraint Verification Table (MANDATORY)
-
-**Before declaring ANY answer, complete this table:**
-
-```
-=== CONSTRAINT VERIFICATION TABLE ===
-
-Answer Candidate: [Your proposed answer]
-
-| # | Constraint | Verification Query | Result | Evidence Source |
-|---|------------|-------------------|--------|----------------|
-| 1 | [Constraint description] | "[Search query]" | ✓/✗/? | [URL or source] |
-| 2 | [Constraint description] | "[Search query]" | ✓/✗/? | [URL or source] |
-| 3 | [Constraint description] | "[Search query]" | ✓/✗/? | [URL or source] |
-...
-
-=== VERIFICATION SUMMARY ===
-Total Constraints: [N]
-Verified (✓): [count]
-Failed (✗): [count]  
-Ambiguous (?): [count]
-
-=== DECISION ===
-IF all ✓ → ACCEPT answer
-IF any ✗ → REJECT and backtrack
-IF any ? → Continue verification
-
-Current Status: [ACCEPT / REJECT / CONTINUE]
-```
-
-**Example (Problem 1 - Correct Approach):**
-
-```
-Answer Candidate: Volume 3
-
-| # | Constraint | Verification Query | Result | Evidence |
-|---|------------|-------------------|--------|----------|
-| 1 | Essay title "Letters to the Deaf" | Verified from query | ✓ | Given |
-| 2 | Essay year 1834 | Verified from query | ✓ | Given |
-| 3 | Series has 5,500 questions | "[Series] app 5500 questions" | ✓ | [Source URL] |
-| 4 | Series has 100 levels | "[Series] app 100 levels" | ✓ | [Source URL] |
-| 5 | Article part of series | "[Article] [Series]" | ✓ | [Source URL] |
-| 6 | Article discusses recommendation | "[Article] Letters to the Deaf" | ✓ | [Source URL] |
-| 7 | Article in journal | "[Article] journal publication" | ✓ | [Source URL] |
-| 8 | Journal volume number | "[Journal] [Article] volume" | ✓ | Volume 3 |
-
-Verification Summary: 8/8 ✓
-Decision: ACCEPT (Volume 3)
-```
-
-**Example (Problem 1 - Wrong Approach - DO NOT DO):**
-
-```
-Answer Candidate: Volume 162
-
-| # | Constraint | Verification Query | Result | Evidence |
-|---|------------|-------------------|--------|----------|
-| 1 | Series is "Who Was?" | Found series exists | ✓ | Wikipedia |
-| 2 | Person is Helen Keller | She's deaf-related | ✓ | Common knowledge |
-| 3 | Found journal article | About deaf education | ✓ | PubMed |
-| 4 | Volume number | Volume 162 found | ✓ | Journal page |
-
-CRITICAL MISSING VERIFICATIONS:
-| 5 | Series has EXACTLY 5,500 questions | NOT VERIFIED | ? | MISSING ✗ |
-| 6 | Series has EXACTLY 100 levels | NOT VERIFIED | ? | MISSING ✗ |
-| 7 | Article is "part of" series | NOT VERIFIED | ? | MISSING ✗ |
-| 8 | Article discusses "Letters to the Deaf" | NOT VERIFIED | ? | MISSING ✗ |
-
-Verification Summary: 4/8 verified, 4/8 missing
-Decision: REJECT ✗ (incomplete verification)
-```
-
----
-
-## 🔬 Phase 6: Anti-Confirmation Bias Checklist
-
-**Before finalizing answer, check these warning signs:**
-
-```
-□ Did I find answer in <5 searches? (Too fast, likely missed something)
-□ Did I verify <80% of constraints? (Incomplete verification)
-□ Is my answer a "famous" entity? (Famous entity bias)
-□ Did I assume rather than verify? (List assumptions, verify each)
-□ Did I skip disambiguation? (For ambiguous phrases)
-□ Did EXACT numbers match? (5,500 vs "thousands")
-□ Did I backtrack when needed? (Or kept pushing wrong path)
-□ Did I test alternative interpretations? (For "part of", "discusses", etc.)
-
-If ANY checkbox ticked → High risk of error, review process
-```
-
----
-
-## 📤 Phase 7: Output Format
-
-### During Search Phase
-
-```
-**Current Goal:** [Which variable am I solving?]
-
-**Hypothesis:** [My current belief about the answer]
-
-**Search Plan:**
-  Query: "[Optimized search query]"
-  Language: [EN/ZH/etc.]
-  Purpose: [What I'm verifying]
-
-**Constraint Verification Progress:**
-  [✓] Constraint 1: [Evidence]
-  [✓] Constraint 2: [Evidence]
-  [ ] Constraint 3: Pending verification
-  [?] Constraint 4: Ambiguous, need more search
-  [✗] Constraint 5: FAILED - triggering backtrack
-
-**Next Action:** [What I'll do based on results]
-```
-
-### Final Answer Phase
-
-```
-**CONSTRAINT VERIFICATION TABLE**
-[Complete table as shown in Phase 5]
-
-**VERIFICATION SUMMARY**
-Total: [N] constraints
-Verified: [N] ✓
-Failed: 0 ✗ (MUST be zero)
-Ambiguous: 0 ? (MUST be zero)
-
-**DECISION:** ACCEPT
-
-**Final Answer:** [Your answer]
-
-**Confidence:** High (all constraints verified from multiple sources)
-```
-
----
-
-## ⚠️ Critical Failure Modes to AVOID
-
-### Failure Mode 1: Premature Conclusion
-```
-❌ BAD:
-  Step 3: Found "Who Was?" series
-  Step 4: Answer must be related to this!
-  (Skipped verification of exact features)
-
-✅ GOOD:
-  Step 3: Found "Who Was?" series (candidate)
-  Step 4: Verify: Does it have EXACTLY 5,500 questions?
-  Step 5: Search result: No exact match ✗
-  Step 6: BACKTRACK, try other series
-```
-
-### Failure Mode 2: Assumption Stacking
-```
-❌ BAD:
-  Assumption 1: Series is "Who Was?" (unverified)
-  Assumption 2: Person is Helen Keller (unverified)
-  Assumption 3: Found article in journal (unverified)
-  Answer: Volume 162 ✗ WRONG
-
-✅ GOOD:
-  Hypothesis 1: Series is "Who Was?"
-  Verify: Search "[Who Was?] 5500 questions 100 levels"
-  Result: No match ✗
-  Action: REJECT hypothesis, try another
-```
-
-### Failure Mode 3: Ignoring Exact Numbers
-```
-❌ BAD:
-  Feature: "5,500 questions"
-  Found: "Thousands of questions"
-  Decision: Close enough! ✗ WRONG
-
-✅ GOOD:
-  Feature: "5,500 questions"
-  Found: "Thousands of questions"
-  Decision: Not exact match ✗ Continue searching
-  Found: "5,500 questions exactly"
-  Decision: EXACT match ✓ Accept
-```
-
-### Failure Mode 4: No Backtracking
-```
-❌ BAD:
-  Step 10: Can't find connection
-  Step 11: Keep searching same thing
-  Step 12: Still can't find
-  Step 13: Guess an answer ✗ WRONG
-
-✅ GOOD:
-  Step 10: Can't find connection (after 2 tries)
-  Step 11: BACKTRACK - reconsider anchor
-  Step 12: Try different interpretation
-  Step 13: Success! Found connection ✓
-```
-
----
-
-## 🎯 Success Checklist (Before Final Answer)
-
-```
-□ ALL variables identified
-□ ALL constraints extracted
-□ Anchor selected using scoring algorithm
-□ Ambiguous phrases disambiguated
-□ EVERY constraint verified with specific search
-□ EXACT numbers matched (not approximate)
-□ Backtracked when verification failed
-□ Tested alternative interpretations
-□ Constraint verification table completed
-□ ALL constraints have ✓ (no ✗ or ?)
-□ Cross-verified from 2+ sources
-□ Answer language matches question language
-```
-
-**Only when ALL boxes checked → Output Final Answer**
-
----
-
-## 💡 Problem 1 Specific Guidance
-
-**For this type of problem (complex entity chain with exact features):**
-
-1. **Extract EVERY numerical feature EXACTLY**
-   - 5,500 questions (not "thousands")
-   - 100 levels (not "many")
-   - 1834 (exact year)
-
-2. **Disambiguate "part of" phrase**
-   - Test: Is article IN the series?
-   - Test: Is article ABOUT the series?
-   - Test: Is article REFERENCING the series?
-
-3. **Verify EVERY link in the chain**
-   - Essay → Recommendation (what was recommended?)
-   - Recommendation → Article (does article discuss it?)
-   - Article → Series (is article part of series?)
-   - Article → Journal (is article in journal?)
-   - Journal → Volume (what volume number?)
-
-4. **Use exact numbers as hard filters**
-   - If series doesn't have EXACTLY 5,500 questions → REJECT
-   - If app doesn't have EXACTLY 100 levels → REJECT
-
-5. **Backtrack early and often**
-   - Can't verify series features after 2 searches? → Backtrack
-   - Can't find article in journal? → Backtrack
-   - ANY constraint fails? → Backtrack
-
-Remember: **Better to backtrack 5 times and get it right than rush to wrong answer.**
-
----
-
-Now proceed with systematic investigation following ALL protocols above.
-"""
+  <step name="识别歧义">
+    <action>对于每一个潜在的歧义短语,进行消歧</action>
+    <action>在继续之前必须测试所有的解释</action>
+  </step>
+</phase>
+
+<phase name="锚点选择">
+  <algorithm name="特异性评分">
+    <score value="+4">罕见的人物/传记约束 (如 "未满20岁创办", "聋哑人发明家")</score>
+    <score value="+3">唯一标识符 (具体头衔, 唯一成就)</score>
+    <score value="+3">确切数字 (确切计数, 确切日期)</score>
+    <score value="+2">具体时间 (确切年份, 具体年代)</score>
+    <score value="+2">具体地点 (城市, 地区)</score>
+    <score value="+1">具名实体 (人名, 公司名)</score>
+    <score value="+1">技术术语 (领域特定词汇)</score>
+    <score value="-1">普通类别 (公司, 人物, 地点)</score>
+    <score value="-2">模糊描述符 (著名的, 重要的, 大型的)</score>
+    <action>选择得分最高的约束作为锚点</action>
+    <action>⚠️ 策略: 如果有多个高分锚点，优先选择**并行搜索**（"集合交集策略"），而不是单一的线性链。</action>
+  </algorithm>
+  
+  <validation>
+    <action>选择锚点后,验证其是否可搜索</action>
+    <action>测试搜索: "[锚点关键词]"</action>
+    <action>如果无相关结果: 尝试次要锚点或将查询分解为更小的部分</action>
+  </validation>
+</phase>
+
+<phase name="搜索执行">
+  <strategy name="带有严格验证的顺序搜索">
+    <loop>对于依赖链中的每一步:</loop>
+    <step>制定搜索查询: 使用 2-3 个最具体的关键词,选择适当的语言,可以使用中文或英文，包含确切的数字/名称</step>
+    <step>执行搜索: 审查前 5-10 个结果,提取候选答案</step>
+    <step>根据所有约束验证候选者:
+      <action>创建验证表</action>
+      <table_format>
+        | 约束 | 验证查询 | 结果 | 证据 |
+        | [约束 1] | "[候选者] [特征 1]" | ✓/✗/? | [来源] |
+      </table_format>
+      <rule>✓ = 找到明确确认</rule>
+      <rule>✗ = 找到矛盾 OR 2 次以上搜索后无证据</rule>
+      <rule>? = 模棱两可,需要更多搜索</rule>
+      <decision>全部 ✓ → 接受候选者,进入下一步</decision>
+      <decision>任何 ✗ → 拒绝候选者,尝试下一个候选者 OR 回溯</decision>
+      <decision>任何 ? → 继续搜索以澄清</decision>
+    </step>
+    <step>如果验证失败: 进入回溯协议</step>
+  </strategy>
+  
+  <protocol name="精确特征匹配">
+    <condition>当查询提到具体的数字或特征时</condition>
+    <action>仅当数字**完全匹配**时接受</action>
+    <example>
+      <correct>找到: "[数字] 个问题" (完全匹配)</correct>
+      <incorrect>找到: "超过 [数字] 个问题" (不完全)</incorrect>
+      <incorrect>找到: "数千个问题" (太模糊)</incorrect>
+    </example>
+  </protocol>
+  
+  <protocol name="语义消歧">
+    <condition>对于像 "part of", "associated with", "discusses" 这样的歧义短语</condition>
+    <step>列出所有可能的解释</step>
+    <step>用具体搜索测试每种解释</step>
+    <step>选择证据最强(搜索结果最多,匹配最明确)的解释</step>
+    <step>根据其他约束验证选定的解释</step>
+  </protocol>
+</phase>
+
+<phase name="回溯协议">
+  <triggers>
+    <trigger>约束验证失败: 搜索 2 次以上,仍无确认</trigger>
+    <trigger>死胡同 (5 次搜索规则): 进行了 5 次以上搜索无进展</trigger>
+    <trigger>假设链太长 (3 次假设规则): 当前路径依赖于 3 个以上未验证的假设</trigger>
+    <trigger>循环搜索: 搜索相同的关键词无改进</trigger>
+    <trigger>精确特征不匹配: 找到匹配部分约束但未通过精确数字/特征匹配的候选者</trigger>
+  </triggers>
+  
+  <decision_tree>
+    <branch question="我是否验证了我的锚点是正确的?">
+      <no>回溯到锚点选择,尝试下一个得分最高的锚点</no>
+    </branch>
+    <branch question="我是否验证了我所有的假设?">
+      <no>回溯以使用约束验证表验证每个假设</no>
+    </branch>
+    <branch question="我是否测试了歧义短语的所有解释?">
+      <no>测试替代解释</no>
+    </branch>
+    <branch question="我是否在搜索正确的实体?">
+      <no>回溯到实体识别</no>
+    </branch>
+    <branch question="我是否尝试了替代搜索策略?">
+      <no>尝试不同的关键词、语言、来源</no>
+      <yes>可能需要承认信息不足</yes>
+    </branch>
+  </decision_tree>
+</phase>
+
+<phase name="输出格式">
+  <section name="搜索阶段">
+    <template>
+**当前目标:** [我正在解决哪个变量?]
+**假设:** [我对答案的当前信念]
+**搜索计划:**
+  查询: "[优化后的搜索查询]"
+  语言: [中文/英文等]
+  目的: [我正在验证什么]
+**约束验证进度:**
+  [✓] 约束 1: [证据]
+  [ ] 约束 2: 等待验证
+**下一步行动:** [基于结果我将做什么]
+    </template>
+  </section>
+  
+  <section name="最终答案阶段">
+    <template>
+**约束验证表**
+[完整的表格]
+
+**验证摘要**
+总计: [N] 个约束
+已验证: [N] ✓
+失败: 0 ✗ (必须为零)
+模棱两可: 0 ? (必须为零)
+
+**决定:** 接受
+
+**最终答案:** [你的答案] 或者 Final Answer: [你的答案]
+
+**置信度:** 高 (所有约束经多个来源验证)
+    </template>
+  </section>
+</phase>
+</workflow>
+
+<failure_modes_to_avoid>
+<mode name="过早结论">跳过精确特征的验证。</mode>
+<mode name="假设堆叠">在未验证的假设上构建链条。</mode>
+<mode name="忽略精确数字">接受 "足够接近" 或模糊的匹配。</mode>
+<mode name="无回溯">坚持死胡同路径而不是转向。</mode>
+</failure_modes_to_avoid>
+
+<success_checklist>
+<item>所有变量已识别</item>
+<item>所有约束已提取</item>
+<item>使用评分算法选择了锚点</item>
+<item>歧义短语已消歧</item>
+<item>每个约束都通过具体搜索进行了验证</item>
+<item>精确数字已匹配 (非近似)</item>
+<item>验证失败时进行了回溯</item>
+<item>测试了替代解释</item>
+<item>约束验证表已完成</item>
+<item>所有约束都有 ✓ (无 ✗ 或 ?)</item>
+<item>经 2 个以上来源交叉验证</item>
+<item>答案语言与问题语言一致</item>
+</success_checklist>
+
+<final_instruction>
+只有当所有方框都勾选 -> 输出最终答案。
+记住: 回溯 5 次找到正确答案比匆忙给出错误答案要好。
+现在按照上述所有协议进行系统的调查。
+</final_instruction>
+</instruction>"""
 
 class AgentState(TypedDict):
     messages: List[dict]
@@ -722,10 +327,14 @@ async def agent_loop(
             if current_step >= threshold:
                 steps_left = limit - current_step
                 urgency_msg = (
-                    f"\n\n⚠️ URGENCY MODE: You have {steps_left} steps remaining.\n"
-                    "1. Try to STOP searching for new information.\n"
-                    "2. You need to SYNTHESIZE existing information.\n"
-                    "3. Prepare to provide the result in the format: `Final Answer: [Your Answer]` soon."
+                    f"\n\n<urgency_mode>\n"
+                    f"  <warning>你还剩下 {steps_left} 步。</warning>\n"
+                    "  <instructions>\n"
+                    "    <instruction>尽量停止搜索新信息。</instruction>\n"
+                    "    <instruction>你需要综合现有信息。</instruction>\n"
+                    "    <instruction>准备尽快以格式: `Final Answer: [Your Answer]` 提供结果。</instruction>\n"
+                    "  </instructions>\n"
+                    "</urgency_mode>"
                 )
                 prompt_messages.append({
                     "role": "system",
@@ -743,71 +352,81 @@ async def agent_loop(
         system_prompt_addition += f"\n{MULTI_HOP_SYSTEM_PROMPT}"
 
         system_prompt_addition += """
+<checkpoints>
+<title>输出最终答案前的关键检查点</title>
+<instruction>在输出最终答案之前，你必须检查：</instruction>
 
-### ⚠️ CRITICAL CHECKPOINTS BEFORE FINAL ANSWER
+<checkpoint name="精确数字验证">
+如果查询提到具体数字 (5,500, 100, 1834 等)：
+□ 我是否精确验证了这些数字？
+□ 我是否找到了 "5,500" 而不仅仅是 "成千上万"？
+□ 我是否找到了 "100" 而不仅仅是 "许多"？
+</checkpoint>
 
-Before outputting final answer, you MUST check:
+<checkpoint name="所有约束已验证">
+□ 我是否创建了验证表？
+□ 每个约束是否有 ✓？
+□ 是否有任何 ✗ 或 ? 标记？(如果有：回溯)
+</checkpoint>
 
-**Checkpoint 1: Exact Number Verification**
-If query mentions specific numbers (5,500, 100, 1834, etc.):
-□ Have I verified these numbers EXACTLY?
-□ Did I find "5,500" not just "thousands"?
-□ Did I find "100" not just "many"?
+<checkpoint name="假设检查">
+□ 我做了多少未验证的假设？
+□ 如果 >2：停止并验证每个假设
+</checkpoint>
 
-**Checkpoint 2: All Constraints Verified**
-□ Have I created a verification table?
-□ Does EVERY constraint have a ✓?
-□ Are there any ✗ or ? marks? (If yes: BACKTRACK)
+<checkpoint name="回溯机会">
+□ 我是否搜索了 >5 次均无进展？
+□ 如果是：回溯到更早的决策点
+</checkpoint>
 
-**Checkpoint 3: Assumption Check**
-□ How many unverified assumptions am I making?
-□ If >2: STOP and verify each assumption
+<checkpoint name="消歧检查">
+□ 是否有歧义短语 ("part of", "associated with")？
+□ 我是否测试了所有解释？
+</checkpoint>
 
-**Checkpoint 4: Backtrack Opportunity**
-□ Have I searched >5 times without progress?
-□ If yes: BACKTRACK to earlier decision point
+<failure_action>如果任何检查点失败 → 不要输出最终答案 → 先解决问题</failure_action>
+</checkpoints>
 
-**Checkpoint 5: Disambiguation Check**
-□ Are there ambiguous phrases ("part of", "associated with")?
-□ Have I tested ALL interpretations?
+<forced_backtrack>
+<condition>搜索 3 次以上，无法验证关键约束</condition>
+<condition>找到候选者但精确数字不匹配</condition>
+<condition>做出 >2 个未验证假设</condition>
+<condition>歧义短语未消歧</condition>
 
-IF ANY checkpoint fails → DO NOT output final answer → Fix the issue first
-
-### 🔄 FORCED BACKTRACK CONDITIONS
-
-You MUST backtrack if:
-1. Searched 3+ times, can't verify a critical constraint
-2. Found candidate but exact numbers don't match
-3. Making >2 unverified assumptions
-4. Ambiguous phrase not disambiguated
-
-When backtracking, explicitly state:
-"BACKTRACKING: [Reason]
+<output_template>
+BACKTRACKING: [Reason]
 Returning to: [Earlier decision point]
-Alternative approach: [What I'll try instead]"
+Alternative approach: [What I'll try instead]
+</output_template>
+</forced_backtrack>
 """
 
         
         system_prompt_addition += """
-### 🧠 Dynamic Autonomous Strategy
-You are an expert autonomous researcher. You are NOT bound by a fixed step-by-step plan.
-Your goal is to satisfy the user's request by dynamically choosing the best action at each step.
+<dynamic_strategy>
+<role>专家自主研究员</role>
+<constraint>不受固定分步计划的约束</constraint>
+<goal>通过动态选择每一步的最佳行动来满足用户的请求。</goal>
 
-**Core Principles:**
-1. **Anchor First**: Identify the most unique or restrictive constraint (the "Anchor") and verify it first.
-2. **Fail Fast & Pivot**: 
-   - If a search query returns nothing relevant, DO NOT repeat it.
-   - **Pivot Strategy**: If one condition cannot be verified (e.g., specific date not found), immediately switch to verifying OTHER conditions to triangulate the answer. Do not get stuck on a single missing detail.
-   - IMMEDIATELY switch to a different search term, a different constraint, or a broader category.
-   - YOU decide when to pivot.
-3. **Completion**: 
-   - Once you have sufficient information (>=3 sources), output the "Final Answer" immediately.
-   - Do not over-verify if the answer is clear.
-   - **IMPORTANT**: When providing the final answer, use the format: `Final Answer: [Your Answer Here]`.
-   - **Do NOT** output "Thought:" traces in your final message content. Only output the final answer text.
+<core_principles>
+<principle name="锚点优先">识别最独特或限制性最强的约束（"锚点"）并首先验证它。</principle>
+<principle name="快速失败与转向">
+  <rule>如果搜索查询未返回任何相关内容，不要重复。</rule>
+  <rule>转向策略：如果无法验证一个条件（例如，未找到具体日期），立即切换到验证其他条件以三角定位答案。不要卡在单个缺失的细节上。</rule>
+  <rule>立即切换到不同的搜索词、不同的约束或更广泛的类别。</rule>
+  <rule>你自己决定何时转向。</rule>
+</principle>
+<principle name="完成">
+  <rule>一旦你有足够的信息（>=5 个来源），并保证大部分信息符合题目描述和题目要求，立即输出 "Final Answer"。</rule>
+  <rule>如果答案清晰，不要过度验证。</rule>
+  <rule>重要：提供最终答案时，使用格式：`Final Answer: [Your Answer Here]`。</rule>
+  <rule>不要在最终消息内容中输出 "Thought:" 痕迹。只输出最终答案文本。</rule>
+</principle>
+</core_principles>
+</dynamic_strategy>
 """
         if plan:
-            system_prompt_addition += f"\n\n### 📋 INITIAL PLAN (Reference Only)\n{plan}\n"
+            system_prompt_addition += f"\n\n<initial_plan>\n{plan}\n</initial_plan>"
 
         # Inject Memory Context
         mem_hits = memory.search(user_query, top_k=4)
@@ -827,6 +446,7 @@ Your goal is to satisfy the user's request by dynamically choosing the best acti
         content_buffer = ""
         
         try:
+            print(f"[AgentLoop] Sending request to LLM (Model: qwen3-max)...")
             stream = client.chat.completions.create(
                 model="qwen3-max",
                 messages=prompt_messages,
@@ -836,6 +456,7 @@ Your goal is to satisfy the user's request by dynamically choosing the best acti
                 max_tokens=1024
             )
             
+            print(f"[AgentLoop] Receiving stream...")
             for chunk in stream:
                 chunk = cast(ChatCompletionChunk, chunk)
                 if not chunk.choices: continue
@@ -843,6 +464,8 @@ Your goal is to satisfy the user's request by dynamically choosing the best acti
                 
                 if delta.content:
                     content_buffer += delta.content
+                    # Real-time thought logging (chunked) could be too verbose, 
+                    # but we can log the accumulated thought at the end or if it's long enough.
                     emitted.append(Chunk(type="text", content=delta.content, step_index=current_step))
                     memory.add_short(delta.content)
                 
@@ -858,6 +481,12 @@ Your goal is to satisfy the user's request by dynamically choosing the best acti
                             tool_calls_buffer[idx]["function"]["name"] = tc_chunk.function.name
                         if tc_chunk.function.arguments:
                             tool_calls_buffer[idx]["function"]["arguments"] += tc_chunk.function.arguments
+                            
+            # --- Enhanced Logging for Reasoning ---
+            if content_buffer:
+                print(f"\n{'='*20} [Step {current_step}] Agent Thought Process {'='*20}")
+                print(f"{content_buffer.strip()}")
+                print(f"{'='*60}\n")
                             
         except Exception as e:
             print(f"[Agent] LLM Error: {e}")
@@ -886,25 +515,46 @@ Your goal is to satisfy the user's request by dynamically choosing the best acti
 
 
         # Check for verification table before Final Answer
-        if "Final Answer:" in content_buffer:
+        if "Final Answer:" in content_buffer or "最终答案:" in content_buffer:
             if "CONSTRAINT VERIFICATION TABLE" not in content_buffer:
                 print("[WARNING] Final answer without verification table!")
                 
                 # Force requirement to supplement verification table
                 error_msg = """
-⚠️ CRITICAL ERROR: You attempted to output Final Answer without a Constraint Verification Table.
-
-You MUST:
-1. List ALL constraints from the original query
-2. For EACH constraint, show:
-   - What you searched
-   - What you found
-   - ✓/✗/? status
-3. Only if ALL are ✓, then output final answer
-
-Please complete the verification table now.
-"""
+512→⚠️ CRITICAL ERROR: You attempted to output Final Answer without a Constraint Verification Table.
+513→
+514→You MUST:
+515→1. List ALL constraints from the original query
+516→2. For EACH constraint, show:
+517→   - What you searched
+518→   - What you found
+519→   - ✓/✗/? status
+520→3. Only if ALL are ✓, then output final answer
+521→
+522→Please complete the verification table now.
+523→"""
                 new_messages.append({"role": "system", "content": error_msg})
+            
+            else:
+                # Answer Cleaning & Verification
+                try:
+                    from .answer_synthesis import verify_and_clean_answer
+                    print(f"[Agent] Triggering Answer Cleaning & Verification... Query: {user_query[:50]}...")
+                    cleaned = verify_and_clean_answer(content_buffer, user_query)
+                    
+                    if cleaned.startswith("ERROR:"):
+                        print(f"[Agent] Answer cleaning failed: {cleaned}")
+                        new_messages[-1]["content"] += f"\n\n[System] Answer Verification Failed: {cleaned}"
+                    else:
+                        print(f"[Agent] Answer verified and cleaned: {cleaned}")
+                        # Append the verified answer
+                        new_messages[-1]["content"] += f"\n\n[System] Verified Final Answer: {cleaned}"
+                        # Emit the cleaned answer so it is visible in the stream
+                        emitted.append(Chunk(type="text", content=f"\n\n[System] Verified Final Answer: {cleaned}", step_index=current_step))
+                        
+                except Exception as e:
+                    print(f"[Agent] Answer cleaning exception: {e}")
+                    new_messages[-1]["content"] += f"\n\n[System] Answer Verification Error: {str(e)}"
 
         return {
             "messages": new_messages,
@@ -984,8 +634,3 @@ Please complete the verification table now.
         print(f"[AgentLoop] Error: {e}")
         import traceback
         traceback.print_exc()
-
-    # Final answer handling (if needed)
-    # The loop yields chunks. If the agent outputs text, it's yielded.
-    # If explicit Final Answer is needed, the agent should have outputted it.
-    

@@ -159,19 +159,23 @@ def build_skills_system_prompt(skills: List[SkillMetadata]) -> str:
 
     return f"""
 <agent_skills>
+<instruction>
 When users ask you to perform tasks, check if any of the available skills below can help complete the task more effectively. Skills provide specialized capabilities and domain knowledge.
+</instruction>
 
-To use a skill:
-1. Read the skill's `SKILL.md` file (with the `load_skill_file` tool) at the provided location to get full instructions.
-2. Follow the instructions within the skill to complete the task
-3. Skills may include scripts, references, and assets that you can access as needed
-4. Execute the script with the `execute_script` tool when the skill requires it
+<usage>
+<step>Read the skill's `SKILL.md` file (with the `load_skill_file` tool) at the provided location to get full instructions.</step>
+<step>Follow the instructions within the skill to complete the task</step>
+<step>Skills may include scripts, references, and assets that you can access as needed</step>
+<step>Execute the script with the `execute_script` tool when the skill requires it</step>
+</usage>
 
-note:
-- You can use the `load_skill_file` tool to load the file content (`SKILL.md` or other files in the skill directory).
-- Only use skills when they are relevant to the current task.
-- Not load same file (SKILL.md or other references file ) multiple times with `load_skill_file` tool.
-- **Must not use the skills as tools, only use the tools provided by the model.**
+<notes>
+<note>You can use the `load_skill_file` tool to load the file content (`SKILL.md` or other files in the skill directory).</note>
+<note>Only use skills when they are relevant to the current task.</note>
+<note>Not load same file (SKILL.md or other references file ) multiple times with `load_skill_file` tool.</note>
+<note>**Must not use the skills as tools, only use the tools provided by the model.**</note>
+</notes>
 
 {skills_xml}
 </agent_skills>

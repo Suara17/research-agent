@@ -91,23 +91,23 @@ class ReflectionManager:
             "phase": "late",
             "trigger_condition": "always",
             "prompt_template": """
-⚠️ **STEP LIMIT WARNING** (Step {current_step}/{max_steps})
+⚠️ **步骤限制警告** (步骤 {current_step}/{max_steps})
 
-You are approaching the maximum step limit. You have limited steps remaining.
-**STRATEGY UPDATE: CONVERGENCE MODE**
+你即将达到最大步骤限制。你剩下的步骤有限。
+**策略更新：收敛模式**
 
-1. **STOP EXPLORING** new paths or entities unless absolutely necessary.
-2. **SYNTHESIZE** the information you have gathered so far.
-3. **DECIDE** on the best possible answer now.
-   - If you have a strong candidate, verify it one last time and output 'Final Answer'.
-   - If you are still uncertain, choose the most likely hypothesis based on available evidence. **Better to answer with confidence than to run out of steps.**
+1. **停止探索** 新的路径或实体，除非绝对必要。
+2. **综合** 你目前收集到的信息。
+3. **决定** 现在可能的最佳答案。
+   - 如果你有一个强有力的候选者，最后验证一次并输出 'Final Answer'。
+   - 如果你仍然不确定，根据现有证据选择最可能的假设。**自信地回答总比耗尽步骤要好。**
 
-**Checklist for Final Answer**:
-- Does it directly answer the user's question?
-- Is the language consistent with the question?
-- Are constraints (Year, Location, Type) satisfied?
+**最终答案检查表**:
+- 它是否直接回答了用户的问题？
+- 语言是否与问题一致？
+- 约束条件（年份、地点、类型）是否满足？
 
-**ACTION**: Provide your 'Final Answer' within the next 2-3 steps.
+**行动**: 在接下来的 2-3 步内提供你的 'Final Answer'。
 """
         }
     ]
@@ -219,31 +219,40 @@ class ConceptVerifier:
         try:
             client = get_llm_client(timeout=30.0)
 
-            prompt = f"""你是一个概念验证专家。请分析Agent对问题的理解是否正确。
+            prompt = f"""<system_prompt>
+你是一个概念验证专家。请分析Agent对问题的理解是否正确。
 
-**原始问题**：
+<original_question>
 {question}
+</original_question>
 
-**Agent的理解/搜索策略**：
+<agent_interpretation>
 {agent_interpretation}
+</agent_interpretation>
 
-请分析：
+<analysis_requirements>
 1. Agent是否正确理解了问题中的专业术语？
 2. Agent的搜索方向是否与问题目标一致？
 3. 是否存在明显的概念误解？
+</analysis_requirements>
 
-输出JSON格式：
+<output_format>
+JSON格式：
 {{
   "is_correct": true/false,
   "issues": ["问题1", "问题2"],
   "suggestions": ["建议1", "建议2"],
   "correct_interpretation": "正确的理解应该是..."
 }}
+</output_format>
 
-**重要**：特别注意以下常见误解：
+<important_notes>
+特别注意以下常见误解：
 - "five-star"可能指酒店、餐厅、博物馆、体育场等不同评级体系
 - "认证"/"accredited"在不同领域有不同含义
 - 地理位置关系的传递性（A在B，B在C，但A可能"不在C"是矛盾的）
+</important_notes>
+</system_prompt>
 """
 
             response = client.chat.completions.create(

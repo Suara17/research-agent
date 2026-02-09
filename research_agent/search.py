@@ -200,28 +200,33 @@ def _optimize_search_query(query: str) -> str:
             return query.strip()
 
         # 2. If query is short/simple, use regex optimization to save time
-        if len(query) < 20 and not any(k in query.lower() for k in ["who", "what", "where", "when", "why", "how"]):
+        if len(query) < 20 and not any(k in query.lower() for k in ["who", "what", "where", "when", "why", "how", "什么", "谁", "哪里", "怎么"]):
             return query.strip()
+            
+        # Add Length Limit Logic
+        if len(query) > 300:
+            query = query[:300]
 
         # 3. Use LLM for complex natural language queries
         client = get_llm_client()
-        prompt = """You are a Search Engine Optimization Expert.
-Convert the user's natural language query into a PRECISE search engine query.
-
-Rules:
-1. Extract CORE KEYWORDS.
-2. Remove conversational filler ("what is", "search for", "I need to find").
-3. For specific entities (Names, Movies), use quotes "" around them.
-4. For riddles or category searches (e.g., "a unit of power"), use "List of..." pattern.
-5. KEEP IT SHORT and effective.
-
-User Query: "{query}"
-Optimized Query (output ONLY the query string):"""
+        prompt = f"""<instruction>
+<role>搜索引擎优化专家</role>
+<task>将用户的自然语言查询转换为精确的搜索引擎查询。</task>
+<rules>
+  <rule>提取核心关键词。</rule>
+  <rule>删除对话填充词 ("什么是", "搜索", "我需要找到")。</rule>
+  <rule>对特定实体 (人名, 电影) 使用引号 ""。</rule>
+  <rule>对于谜题或类别搜索, 使用 "List of..." 模式。</rule>
+  <rule>保持简短有效。</rule>
+</rules>
+<input>{query}</input>
+<output>仅返回查询字符串。</output>
+</instruction>"""
         
         response = client.chat.completions.create(
             model="qwen3-max",
             messages=[
-                {"role": "system", "content": prompt.replace("{query}", query)},
+                {"role": "system", "content": prompt},
             ],
             temperature=0.1,
             max_tokens=64
@@ -269,7 +274,7 @@ def _translate_query(query: str, target_lang: str = "English") -> str:
         client = get_llm_client()
         resp = client.chat.completions.create(
             model="qwen3-max",
-            messages=[{"role": "user", "content": f"Translate this search query to {target_lang} for search engine optimization. Keep proper nouns and key terms accurate: {query}"}],
+            messages=[{"role": "user", "content": f"<instruction><task>为搜索引擎优化翻译搜索查询</task><target_lang>{target_lang}</target_lang><constraint>保持专有名词和关键术语准确</constraint><query>{query}</query></instruction>"}],
             max_tokens=128
         )
         return resp.choices[0].message.content.strip().strip('"')
@@ -288,15 +293,18 @@ def _extract_search_slots(query: str) -> dict:
     try:
         client = get_llm_client()
         prompt = [
-            {"role": "system", "content": """Extract search slots from the query.
-Output JSON with keys:
-- type: "Person", "Organization", "Event", "Object" or "Other"
-- hard_constraints: list of strict conditions (year, location, role, specific event)
-- soft_constraints: list of descriptive conditions (scandals, education, family)
-- anchors: list of unique keywords for search (names, specific terms)
-- target_country: country name if applicable (in English), else null
-"""},
-            {"role": "user", "content": query}
+            {"role": "system", "content": """<instruction>
+<task>从查询中提取搜索槽位。</task>
+<output_format>json_object</output_format>
+<keys>
+  <key name="type">"Person" | "Organization" | "Event" | "Object" | "Other"</key>
+  <key name="hard_constraints">严格条件列表 (年份, 地点, 角色, 具体事件)</key>
+  <key name="soft_constraints">描述性条件列表 (丑闻, 教育, 家庭)</key>
+  <key name="anchors">用于搜索的唯一关键词列表 (名称, 具体术语)</key>
+  <key name="target_country">国家名称 (英文) 如果适用, 否则 null</key>
+</keys>
+</instruction>"""},
+            {"role": "user", "content": f"<input><query>{query}</query></input>"}
         ]
         resp = client.chat.completions.create(
             model="qwen3-max", 
@@ -391,6 +399,16 @@ def web_search(query: str, top_k: int = 5) -> str:
         if not isinstance(query, str) or not query.strip():
             return json.dumps({"error": "empty_query"}, ensure_ascii=False)
 
+        # Entity Quantity Detection and Limit
+        quoted_entities = re.findall(r'"[^"]+"', query)
+        if len(quoted_entities) > 6:
+            print(f"[Monitoring] Query contains {len(quoted_entities)} entities (limit 6). Truncating...")
+            matches = list(re.finditer(r'"[^"]+"', query))
+            if len(matches) > 6:
+                # Keep first 6 entities
+                cutoff = matches[5].end()
+                query = query[:cutoff]
+
         optimized = _optimize_search_query(query)
         queries_to_try = [optimized]
         
@@ -426,6 +444,8 @@ def web_search(query: str, top_k: int = 5) -> str:
         for attempt_idx, current_q in enumerate(queries_to_try):
             if attempt_idx > 0:
                 print(f"[Monitoring] Primary search failed/empty. Retrying with simplified query: '{current_q}'")
+
+            print(f"\n[Search] Executing Search: '{current_q}' (Original: '{query}')")
 
             is_chinese_query = any("\u4e00" <= ch <= "\u9fff" for ch in current_q)
 
@@ -514,6 +534,13 @@ def web_search(query: str, top_k: int = 5) -> str:
                         if results:
                             results = _filter_search_results(results)
                             results = _rerank_search_results(results, query, k)
+                            
+                            # --- Enhanced Logging ---
+                            print(f"[Search] Found {len(results)} results via SerpApi.")
+                            for i, res in enumerate(results[:3]): # Log top 3
+                                print(f"  [{i+1}] {res['title']} ({res['url']})\n      {res['summary'][:100]}...")
+                            # ------------------------
+
                             return json.dumps({"source": "serpapi-lib", "results": results}, ensure_ascii=False)
                     else:
                         url = "https://serpapi.com/search"
@@ -937,8 +964,8 @@ def browse_page(url: str, instructions: str, max_bytes: int = 150_000) -> str:
         content = str(data.get("content") or "")
         title = str(data.get("title") or "")
         prompt = [
-            {"role": "system", "content": "You are a research assistant that produces concise structured summaries."},
-            {"role": "user", "content": f"Task: {instructions}\nTitle: {title}\nContent:\n{content[:8000]}"},
+            {"role": "system", "content": "<instruction><role>研究助理</role><task>生成简洁的结构化摘要。</task></instruction>"},
+            {"role": "user", "content": f"<input><task>{instructions}</task><title>{title}</title><content>{content[:8000]}</content></input>"},
         ]
         client = get_llm_client(timeout=30.0)
         resp = client.chat.completions.create(model="qwen3-max", stream=False, temperature=0.3, max_tokens=800, messages=prompt)
@@ -1012,8 +1039,8 @@ def browse_pdf_attachment(url: str, instructions: str, max_pages: int = 6) -> st
         except Exception as e:
             return json.dumps({"error": "pdf_extract_failed", "message": str(e), "suggestions": ["install pypdf"]}, ensure_ascii=False)
         prompt = [
-            {"role": "system", "content": "You summarize PDF content into concise structured facts."},
-            {"role": "user", "content": f"Task: {instructions}\nContent:\n{text[:8000]}"},
+            {"role": "system", "content": "<instruction><role>Research Assistant</role><task>Summarize PDF content into concise structured facts.</task></instruction>"},
+            {"role": "user", "content": f"<input><task>{instructions}</task><content>{text[:8000]}</content></input>"},
         ]
         client = get_llm_client(timeout=30.0)
         resp = client.chat.completions.create(model="qwen3-max", stream=False, temperature=0.3, max_tokens=800, messages=prompt)

@@ -88,7 +88,7 @@ def _translate_query(query: str, target_lang: str = "English") -> str:
 
         resp = client.chat.completions.create(
             model="qwen3-max",
-            messages=[{"role": "user", "content": f"Translate this search query to {target_lang} for search engine optimization. Keep proper nouns and key terms accurate: {sanitized_query}"}],
+            messages=[{"role": "user", "content": f"<instruction><task>Translate search query for search engine optimization</task><target_lang>{target_lang}</target_lang><constraint>Keep proper nouns and key terms accurate</constraint><query>{sanitized_query}</query></instruction>"}],
             max_tokens=128
         )
         return resp.choices[0].message.content.strip().strip('"')
@@ -127,15 +127,18 @@ def _extract_search_slots(query: str) -> dict:
             logger.debug(f"[SensitiveFilter] 搜索槽位提取时过滤了 {len(replacements)} 个敏感词")
 
         prompt = [
-            {"role": "system", "content": """Extract search slots from the query.
-Output JSON with keys:
-- type: "Person", "Organization", "Event", "Object" or "Other"
-- hard_constraints: list of strict conditions (year, location, role, specific event)
-- soft_constraints: list of descriptive conditions (scandals, education, family)
-- anchors: list of unique keywords for search (names, specific terms)
-- target_country: country name if applicable (in English), else null
-"""},
-            {"role": "user", "content": sanitized_query}
+            {"role": "system", "content": """<instruction>
+<task>Extract search slots from the query.</task>
+<output_format>json_object</output_format>
+<keys>
+  <key name="type">"Person" | "Organization" | "Event" | "Object" | "Other"</key>
+  <key name="hard_constraints">list of strict conditions (year, location, role, specific event)</key>
+  <key name="soft_constraints">list of descriptive conditions (scandals, education, family)</key>
+  <key name="anchors">list of unique keywords for search (names, specific terms)</key>
+  <key name="target_country">country name (English) if applicable, else null</key>
+</keys>
+</instruction>"""},
+            {"role": "user", "content": f"<input><query>{sanitized_query}</query></input>"}
         ]
         resp = client.chat.completions.create(
             model="qwen3-max",

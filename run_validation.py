@@ -14,7 +14,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from research_agent.core import agent_loop
 from research_agent.search import web_search, web_fetch, get_weather, browse_page, x_keyword_search, search_pdf_attachment, browse_pdf_attachment
-from research_agent.utils import clean_answer
+from research_agent.answer_synthesis import verify_and_clean_answer
 from agent import QueryRequest
 
 # Setup logging specific to validation
@@ -215,7 +215,8 @@ INSTRUCTION: Analyze the rejection reasons. Change your search strategy to avoid
     
     final_answer = raw_result
     if raw_result:
-        final_answer = clean_answer(raw_result)
+        # Use verify_and_clean_answer to ensure language consistency
+        final_answer = verify_and_clean_answer(raw_result, question)
 
     search_summary = "\n".join(search_summary_parts[-10:]) if search_summary_parts else ""
     return (final_answer, raw_result, final_memory, search_summary, False) # Return raw_result as trace

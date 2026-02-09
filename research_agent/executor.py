@@ -73,11 +73,14 @@ def execute_tools_logic(state: dict, tool_functions_map: dict, memory) -> dict:
 
         # Simple summarization for long content
         if func_name in ["web_fetch", "browse_page"] and len(tool_result_content) > 1000:
-            distill_prompt = f"Summarize the key facts (entities, dates, numbers) from this text, removing ads and navigation:\n{tool_result_content[:4000]}"
+            distill_instruction = "<instruction><task>Summarize key facts from the text.</task><details>Extract entities, dates, numbers; remove ads and navigation.</details></instruction>"
             try:
                 distill_resp = client.chat.completions.create(
                     model="qwen3-max",
-                    messages=[{"role": "user", "content": distill_prompt}],
+                    messages=[
+                        {"role": "system", "content": distill_instruction},
+                        {"role": "user", "content": f"<input><text>{tool_result_content[:4000]}</text></input>"}
+                    ],
                     max_tokens=512
                 )
                 summary = distill_resp.choices[0].message.content

@@ -191,8 +191,8 @@ def clean_answer(raw_answer: str) -> str:
             response = client.chat.completions.create(
                 model="qwen3-max",
                 messages=[
-                    {"role": "system", "content": "You are an answer extractor. Read the provided text and extract the Final Answer. Output ONLY the answer text. Do not output 'The answer is...'. If no answer is found, output the most relevant conclusion."},
-                    {"role": "user", "content": f"Text:\n{clean[:2000]}"} # Truncate to avoid context limit
+                    {"role": "system", "content": "<instruction><role>Answer Extractor</role><task>Read the provided text and extract the Final Answer.</task><rules><rule>Output ONLY the answer text.</rule><rule>Do not output 'The answer is...'.</rule><rule>If no answer is found, output the most relevant conclusion.</rule></rules></instruction>"},
+                    {"role": "user", "content": f"<input><text>{clean[:2000]}</text></input>"} # Truncate to avoid context limit
                 ],
                 temperature=0.1,
                 max_tokens=200

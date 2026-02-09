@@ -17,6 +17,7 @@ from research_agent import (
     browse_pdf_attachment,
     get_weather,
     clean_answer,
+    verify_and_clean_answer,
     CandidatePool
 )
 
@@ -133,7 +134,8 @@ async def query(req: QueryRequest) -> QueryResponse:
             result += chunk.content
 
     if result:
-        result = clean_answer(result)
+        # Use verify_and_clean_answer to ensure language consistency
+        result = verify_and_clean_answer(result, req.question)
 
     return QueryResponse(answer=result)
 
