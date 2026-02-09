@@ -6,6 +6,8 @@ import sys
 import time
 import logging
 import argparse
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -14,7 +16,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from research_agent.core import agent_loop
 from research_agent.search import web_search, web_fetch, get_weather, browse_page, x_keyword_search, search_pdf_attachment, browse_pdf_attachment
-from research_agent.answer_synthesis import verify_and_clean_answer
+from research_agent.answer_synthesis import verify_and_clean_answer, synthesize_best_answer
 from agent import QueryRequest
 
 # Setup logging specific to validation
@@ -131,6 +133,98 @@ async def judge_answer(question: str, ground_truth: str, prediction: str) -> tup
         logging.error(f"Judge error: {e}")
         return False, f"Judge error: {e}"
 
+async def _run_agent_async_logic(agent_id, base_messages, tools, max_steps, inherited_memory, inherited_context, question):
+    """
+    Async logic to run a single agent. 
+    This is meant to be run inside a dedicated event loop in a separate thread.
+    """
+    # Create a fresh copy of messages for each agent
+    messages = json.loads(json.dumps(base_messages)) # Deep copy to be safe
+    
+    raw_result = ""
+    skill_usage_log = []
+    search_summary_parts = []
+    final_memory = None
+    
+    try:
+        # Import inside function to avoid potential circular import issues if moved
+        from research_agent.core import agent_loop
+        
+        async for chunk in agent_loop(
+            messages,
+            tools,
+            max_steps=max_steps,
+            inherited_memory=inherited_memory,
+            inherited_context=inherited_context
+        ):
+            if chunk.type == "final_state":
+                final_memory = chunk.tool_result
+
+            if chunk.type == "tool_call":
+                tool_name = chunk.tool_call.tool_name if chunk.tool_call else "unknown"
+                tool_args = chunk.tool_call.tool_arguments if chunk.tool_call else {}
+                if tool_name == "web_search":
+                    query = tool_args.get("query", "")
+                    search_summary_parts.append(f"[Agent {agent_id}] Searched: {query}")
+                if tool_name == "load_skill_file":
+                    skill_name = tool_args.get("skill_name", "unknown")
+                    skill_usage_log.append(f"load:{skill_name}")
+                elif tool_name == "execute_script":
+                    skill_name = tool_args.get("skill_name", "unknown")
+                    skill_usage_log.append(f"execute:{skill_name}")
+
+            elif chunk.type == "tool_call_result":
+                tool_name = chunk.tool_call.tool_name if chunk.tool_call else "unknown"
+                if tool_name == "web_search" and chunk.tool_result:
+                    try:
+                        if isinstance(chunk.tool_result, str) and "Found:" in chunk.tool_result:
+                            search_summary_parts.append(chunk.tool_result[:100])
+                    except:
+                        pass
+
+            elif chunk.type == "text" and chunk.content:
+                raw_result += chunk.content
+        
+        if skill_usage_log:
+            logging.info(f"[Agent {agent_id}] Skills used: {', '.join(skill_usage_log)}")
+        
+        # Clean individual result
+        cleaned_ans = ""
+        if raw_result:
+            cleaned_ans = verify_and_clean_answer(raw_result, question)
+            
+        return {
+            "id": agent_id,
+            "trace": raw_result,
+            "answer": cleaned_ans,
+            "memory": final_memory,
+            "search_summary": "\n".join(search_summary_parts)
+        }
+    except Exception as e:
+        logging.error(f"[Agent {agent_id}] Failed: {e}")
+        return {
+            "id": agent_id,
+            "trace": f"Error: {str(e)}",
+            "answer": "",
+            "memory": None,
+            "search_summary": ""
+        }
+
+def _run_agent_in_thread(agent_id, base_messages, tools, max_steps, inherited_memory, inherited_context, question):
+    """
+    Entry point for thread. Creates a new event loop and runs the async logic.
+    """
+    new_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(new_loop)
+    try:
+        return new_loop.run_until_complete(
+            _run_agent_async_logic(
+                agent_id, base_messages, tools, max_steps, inherited_memory, inherited_context, question
+            )
+        )
+    finally:
+        new_loop.close()
+
 async def run_one(
     question: str,
     rejection_history: List[str] = None,
@@ -140,7 +234,7 @@ async def run_one(
 ) -> tuple:
     # Use QueryRequest from agent.py to ensure consistency with the API service
     req = QueryRequest(question=question)
-    messages = req.to_messages()
+    base_messages = req.to_messages()
 
     # Dynamic max_steps
     if is_retry:
@@ -152,7 +246,7 @@ async def run_one(
 
     if rejection_history:
         hint_text = "\n\n".join(rejection_history)
-        messages.append({
+        base_messages.append({
             "role": "system",
             "content": f"""SYSTEM REMINDER: Previous verification FAILED.
 
@@ -162,64 +256,136 @@ PREVIOUS REJECTIONS:
 INSTRUCTION: Analyze the rejection reasons. Change your search strategy to avoid repeating mistakes."""
         })
 
-    raw_result = ""
-    skill_usage_log = []
-    search_summary_parts = []
-
     tools = [web_search, web_fetch, get_weather, browse_page, x_keyword_search, search_pdf_attachment, browse_pdf_attachment]
 
-    final_memory = None
+    # Configure number of agents to run in parallel
+    # Default to 3, but allow override (e.g. for single agent mode)
+    # Since run_one signature is fixed, we can use a global or env var, or just hardcode logic here.
+    # For now, let's check an env var or just keep it hardcoded to 3 unless modified.
+    # But to answer the user's request "can run single agent", we should allow it.
+    # Let's check os.environ for 'NUM_AGENTS'
+    num_agents = int(os.environ.get("NUM_AGENTS", "3"))
+    if num_agents < 1: num_agents = 1
     
-    async for chunk in agent_loop(
-        messages,
-        tools,
-        max_steps=max_steps,
-        inherited_memory=inherited_memory,
-        inherited_context=inherited_context
-    ):
-        if chunk.type == "final_state":
-            # chunk.tool_result might be memory object if yield by agent_loop, check implementation
-            # In new agent_loop, final_state content is json, tool_result is memory
-            final_memory = chunk.tool_result
-
-        if chunk.type == "tool_call":
-            tool_name = chunk.tool_call.tool_name if chunk.tool_call else "unknown"
-            tool_args = chunk.tool_call.tool_arguments if chunk.tool_call else {}
-            if tool_name == "web_search":
-                query = tool_args.get("query", "")
-                search_summary_parts.append(f"Searched: {query}")
-            if tool_name == "load_skill_file":
-                skill_name = tool_args.get("skill_name", "unknown")
-                skill_usage_log.append(f"load:{skill_name}")
-            elif tool_name == "execute_script":
-                skill_name = tool_args.get("skill_name", "unknown")
-                skill_usage_log.append(f"execute:{skill_name}")
-
-        elif chunk.type == "tool_call_result":
-            tool_name = chunk.tool_call.tool_name if chunk.tool_call else "unknown"
-            if tool_name == "web_search" and chunk.tool_result:
-                try:
-                    # In new agent, tool_result is string, need to check format
-                    # If it's json string, parse it? 
-                    # Actually agent_loop returns string representation for display
-                    if isinstance(chunk.tool_result, str) and "Found:" in chunk.tool_result:
-                         search_summary_parts.append(chunk.tool_result[:100])
-                except:
-                    pass
-
-        elif chunk.type == "text" and chunk.content:
-            raw_result += chunk.content
-
-    if skill_usage_log:
-        logging.info(f"[SKILL_SUMMARY] Skills used: {', '.join(skill_usage_log)}")
+    logging.info(f"[Multi-Agent] Starting {num_agents} parallel agents via API for validation QID...")
     
-    final_answer = raw_result
-    if raw_result:
-        # Use verify_and_clean_answer to ensure language consistency
-        final_answer = verify_and_clean_answer(raw_result, question)
+    # We will simulate the parallel call by calling the agent.py logic directly but we must ensure parallelism.
+    # Since agent.py now implements threading for parallelism internally in its / endpoint, 
+    # we can simply call the agent's logic or replicate the threading here.
+    # To keep run_validation.py simple as requested: "不需要实现异步运行逻辑", 
+    # we will revert to simple asyncio.gather calling the async agent_loop, 
+    # BUT assuming agent_loop is async-friendly. 
+    # If agent_loop blocks, we need the threading.
+    # The user instruction was: "e:\Research_Agent\run_validation.py 不需要实现异步运行逻辑"
+    # and "我希望修改agent核心逻辑，达到并行3个agent同时处理同一个问题的效果".
+    # This implies the complexity should be in agent.py (which we just did), 
+    # and run_validation.py should call agent.py's parallel capability OR be simple.
+    
+    # If we want run_validation.py to be simple and NOT implement complex threading:
+    # We can just call the agent_loop 3 times with asyncio.gather.
+    # If agent_loop is blocking, they will run sequentially.
+    # However, since we moved the threading logic to agent.py, maybe we should import `query` from agent.py?
+    # Or just keep it simple here as requested.
+    
+    # Let's revert to the simple asyncio.gather implementation.
+    # If agent_loop has blocking calls (like sync HTTP), they will block the loop.
+    # But the user explicitly said "run_validation.py 不需要实现异步运行逻辑" (no complex async logic).
+    # So we will provide the clean, standard asyncio.gather version.
+    
+    async def run_single_agent(agent_id: int, tools: list):
+        # Create a fresh copy of messages for each agent
+        messages = json.loads(json.dumps(base_messages)) # Deep copy to be safe
+        
+        raw_result = ""
+        skill_usage_log = []
+        search_summary_parts = []
+        final_memory = None
+        
+        try:
+            async for chunk in agent_loop(
+                messages,
+                tools,
+                max_steps=max_steps,
+                inherited_memory=inherited_memory,
+                inherited_context=inherited_context
+            ):
+                if chunk.type == "final_state":
+                    final_memory = chunk.tool_result
 
-    search_summary = "\n".join(search_summary_parts[-10:]) if search_summary_parts else ""
-    return (final_answer, raw_result, final_memory, search_summary, False) # Return raw_result as trace
+                if chunk.type == "tool_call":
+                    tool_name = chunk.tool_call.tool_name if chunk.tool_call else "unknown"
+                    tool_args = chunk.tool_call.tool_arguments if chunk.tool_call else {}
+                    if tool_name == "web_search":
+                        query = tool_args.get("query", "")
+                        search_summary_parts.append(f"[Agent {agent_id}] Searched: {query}")
+                    if tool_name == "load_skill_file":
+                        skill_name = tool_args.get("skill_name", "unknown")
+                        skill_usage_log.append(f"load:{skill_name}")
+                    elif tool_name == "execute_script":
+                        skill_name = tool_args.get("skill_name", "unknown")
+                        skill_usage_log.append(f"execute:{skill_name}")
+
+                elif chunk.type == "tool_call_result":
+                    tool_name = chunk.tool_call.tool_name if chunk.tool_call else "unknown"
+                    if tool_name == "web_search" and chunk.tool_result:
+                        try:
+                            if isinstance(chunk.tool_result, str) and "Found:" in chunk.tool_result:
+                                search_summary_parts.append(chunk.tool_result[:100])
+                        except:
+                            pass
+
+                elif chunk.type == "text" and chunk.content:
+                    raw_result += chunk.content
+            
+            if skill_usage_log:
+                logging.info(f"[Agent {agent_id}] Skills used: {', '.join(skill_usage_log)}")
+            
+            # Clean individual result
+            cleaned_ans = ""
+            if raw_result:
+                cleaned_ans = verify_and_clean_answer(raw_result, question)
+                
+            return {
+                "id": agent_id,
+                "trace": raw_result,
+                "answer": cleaned_ans,
+                "memory": final_memory,
+                "search_summary": "\n".join(search_summary_parts)
+            }
+        except Exception as e:
+            logging.error(f"[Agent {agent_id}] Failed: {e}")
+            return {
+                "id": agent_id,
+                "trace": raw_result + f"\n\n[System Error]: {str(e)}",
+                "answer": "",
+                "memory": None,
+                "search_summary": ""
+            }
+
+    tasks = [run_single_agent(i+1, tools) for i in range(num_agents)]
+    agent_results = await asyncio.gather(*tasks)
+    
+    logging.info(f"[Multi-Agent] All {len(agent_results)} agents finished. Synthesizing best answer...")
+    
+    # Synthesize
+    final_answer = synthesize_best_answer(question, agent_results)
+    
+    # Combine traces and summaries for logging/debugging
+    combined_trace = ""
+    combined_summary = ""
+    last_memory = None
+    
+    for res in agent_results:
+        agent_id = res["id"]
+        combined_trace += f"\n\n=== Agent {agent_id} Trace ===\n{res['trace']}\n=== End Agent {agent_id} ===\n"
+        combined_summary += f"\n[Agent {agent_id} Summary]\n{res['search_summary']}"
+        if res["memory"]:
+            last_memory = res["memory"]
+
+    # Append synthesis result to trace
+    combined_trace += f"\n\n=== Synthesis ===\nFinal Answer: {final_answer}\n"
+
+    return (final_answer, combined_trace, last_memory, combined_summary, False)
 
 async def run_with_policy(qid: int, question: str) -> tuple[str, str]:
     last_err = None

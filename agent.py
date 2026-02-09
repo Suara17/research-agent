@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 from typing import Optional, List
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
@@ -20,6 +21,7 @@ from research_agent import (
     verify_and_clean_answer,
     CandidatePool
 )
+from research_agent.answer_synthesis import synthesize_best_answer
 
 try:
     from agui import stream_agui_events, to_openai_messages, to_sse_data
@@ -119,25 +121,68 @@ class QueryResponse(BaseModel):
 
 @app.post("/")
 async def query(req: QueryRequest) -> QueryResponse:
-    max_steps = 30 # Simplified fixed max steps
+    max_steps = 30 # Fixed max steps
     
-    result = ""
-    messages = req.to_messages()
+    # Define a helper to run a single agent instance
+    async def run_single_agent(agent_id: int):
+        trace_chunks = []
+        final_res = ""
+        # Create a fresh copy of messages for each agent
+        # req.to_messages() returns a new list each time, so it's safe
+        messages = req.to_messages() 
+        
+        # Add a system hint to differentiate them slightly (optional, but good for diversity)
+        # For now, we rely on temperature randomness
+        
+        async for chunk in agent_loop(
+            messages, 
+            [web_search, web_fetch, browse_page, x_keyword_search, search_pdf_attachment, browse_pdf_attachment, get_weather], 
+            max_steps=max_steps
+        ):
+            if chunk.type == "text" and chunk.content:
+                trace_chunks.append(chunk.content)
+        
+        full_trace = "".join(trace_chunks)
+        
+        # Extract the final answer from the trace using existing logic
+        # We use verify_and_clean_answer on the individual result too, to clean it up
+        cleaned_ans = verify_and_clean_answer(full_trace, req.question)
+        
+        return {
+            "id": agent_id,
+            "trace": full_trace,
+            "answer": cleaned_ans
+        }
 
-    # Call agent_loop directly
-    async for chunk in agent_loop(
-        messages, 
-        [web_search, web_fetch, browse_page, x_keyword_search, search_pdf_attachment, browse_pdf_attachment, get_weather], 
-        max_steps=max_steps
-    ):
-        if chunk.type == "text" and chunk.content:
-            result += chunk.content
+    # Run 3 agents in parallel using threading to avoid event loop blocking
+    print(f"[Multi-Agent] Starting 3 parallel agents for query: {req.question[:50]}...")
+    
+    # Helper to run async function in a new thread with new loop
+    def run_in_new_thread(agent_id):
+        import asyncio
+        new_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(new_loop)
+        try:
+            return new_loop.run_until_complete(run_single_agent(agent_id))
+        finally:
+            new_loop.close()
 
-    if result:
-        # Use verify_and_clean_answer to ensure language consistency
-        result = verify_and_clean_answer(result, req.question)
-
-    return QueryResponse(answer=result)
+    import concurrent.futures
+    loop = asyncio.get_running_loop()
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [
+            loop.run_in_executor(executor, run_in_new_thread, i)
+            for i in [1, 2, 3]
+        ]
+        results = await asyncio.gather(*futures)
+    
+    print(f"[Multi-Agent] All 3 agents finished. Synthesizing best answer...")
+    
+    # Synthesize the final answer
+    final_answer = synthesize_best_answer(req.question, results)
+    
+    return QueryResponse(answer=final_answer)
 
 
 @app.post("/stream")

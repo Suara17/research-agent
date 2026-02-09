@@ -49,6 +49,18 @@ MULTI_HOP_SYSTEM_PROMPT = """<instruction>
   <rule>答案语言一致性: 除非明确要求,否则必须用**与用户问题相同的语言**回答。</rule>
   <rule>区域感知搜索: 对于涉及特定地区(如中国、日本)的实体,**必须**使用当地语言(中文、日文)进行搜索。</rule>
 </protocol>
+<protocol name="实体匹配与容错">
+  <rule>语义理解: 必须识别实体的同义词、别名、历史名称、缩写、官方与民间称呼（如 "Beijing" = "Peking", "USSR" = "Soviet Union"）。</rule>
+  <rule>包含关系: 当名称不完全匹配时，检查是否存在上下位关系（"北京市" ⊇ "北京"）、部分整体关系（"欧盟" ⊇ "法国"）或历史沿革关系（"苏联" -> "俄罗斯"）。</rule>
+  <rule>容错机制: 允许拼写差异、多语言名称变体（"China/中国"）及常见翻译差异（"John Smith" = "约翰·史密斯"）。</rule>
+</protocol>
+
+<protocol name="知名度与权威性优先">
+  <rule>**高知名度优先**: 当描述符合多个实体时，优先假设并验证具有**全球知名度**的候选者（如奥运会、诺贝尔奖、世界遗产、国家元首）。</rule>
+  <rule>**权威来源偏好**: 优先寻找并信任来自权威机构、主流媒体或百科全书的资料。</rule>
+  <rule>**低优先级**: 对于搜索量极低、仅出现在个别论坛或非权威博客的冷门主题，仅在知名候选者被明确证伪后才考虑。</rule>
+  <example>描述 "国际体育盛会" -> 优先验证 "奥运会"，而非 "某个地区的业余运动会"。</example>
+</protocol>
 </protocols>
 
 <workflow>
@@ -93,7 +105,7 @@ MULTI_HOP_SYSTEM_PROMPT = """<instruction>
   <validation>
     <action>选择锚点后,验证其是否可搜索</action>
     <action>测试搜索: "[锚点关键词]"</action>
-    <action>如果无相关结果: 尝试次要锚点或将查询分解为更小的部分</action>
+    <action>如果无相关结果: 优先尝试次要锚点或将查询分解为更小的部分</action>
   </validation>
 </phase>
 
@@ -108,7 +120,7 @@ MULTI_HOP_SYSTEM_PROMPT = """<instruction>
         | 约束 | 验证查询 | 结果 | 证据 |
         | [约束 1] | "[候选者] [特征 1]" | ✓/✗/? | [来源] |
       </table_format>
-      <rule>✓ = 找到明确确认</rule>
+      <rule>✓ = 找到明确确认 (包括语义匹配/包含关系)</rule>
       <rule>✗ = 找到矛盾 OR 2 次以上搜索后无证据</rule>
       <rule>? = 模棱两可,需要更多搜索</rule>
       <decision>全部 ✓ → 接受候选者,进入下一步</decision>
@@ -120,21 +132,14 @@ MULTI_HOP_SYSTEM_PROMPT = """<instruction>
   
   <protocol name="精确特征匹配">
     <condition>当查询提到具体的数字或特征时</condition>
-    <action>仅当数字**完全匹配**时接受</action>
+    <action>数字必须完全匹配，但实体名称可应用模糊/语义匹配</action>
     <example>
       <correct>找到: "[数字] 个问题" (完全匹配)</correct>
       <incorrect>找到: "超过 [数字] 个问题" (不完全)</incorrect>
       <incorrect>找到: "数千个问题" (太模糊)</incorrect>
     </example>
   </protocol>
-  
-  <protocol name="语义消歧">
-    <condition>对于像 "part of", "associated with", "discusses" 这样的歧义短语</condition>
-    <step>列出所有可能的解释</step>
-    <step>用具体搜索测试每种解释</step>
-    <step>选择证据最强(搜索结果最多,匹配最明确)的解释</step>
-    <step>根据其他约束验证选定的解释</step>
-  </protocol>
+
 </phase>
 
 <phase name="回溯协议">
@@ -293,9 +298,15 @@ async def agent_loop(
 
     # --- Node Definitions ---
 
-    def planner_node(state: AgentState) -> dict:
+    # Define nodes as async to allow async execution within LangGraph if supported
+    # Even if LangGraph executes them, we need to ensure blocking calls inside are handled.
+    
+    async def planner_node(state: AgentState) -> dict:
         # Generate initial plan
-        plan_data = generate_plan(user_query)
+        # generate_plan uses sync client, wrap it
+        import asyncio
+        plan_data = await asyncio.to_thread(generate_plan, user_query)
+        
         plan = plan_data.get("plan", "")
         recommended_steps = plan_data.get("max_steps", 30)
         
@@ -305,7 +316,7 @@ async def agent_loop(
         # emitted = [Chunk(step_index=0, type="text", content=f"Created Plan:\n{plan}\n")]
         return {"plan": plan, "max_steps": recommended_steps}
 
-    def agent_node(state: AgentState) -> dict:
+    async def agent_node(state: AgentState) -> dict:
         current_step = state["step_index"]
         limit = state.get("max_steps", max_steps)
         
@@ -447,14 +458,28 @@ Alternative approach: [What I'll try instead]
         
         try:
             print(f"[AgentLoop] Sending request to LLM (Model: qwen3-max)...")
-            stream = client.chat.completions.create(
-                model="qwen3-max",
-                messages=prompt_messages,
-                tools=tool_schema,
-                stream=True,
-                temperature=0.4,
-                max_tokens=1024
-            )
+            
+            # Use asyncio.to_thread to run sync LLM call in a separate thread
+            # This prevents blocking the event loop and allows parallelism
+            import asyncio
+            from functools import partial
+            
+            # Wrapper for the sync generator to consume it and return full response
+            # Since streaming across threads is complex with asyncio.to_thread,
+            # we might need to consume the stream in the thread or use a different approach.
+            # Simplest approach for parallelism: Run the blocking call in a thread.
+            
+            def run_llm_sync():
+                return client.chat.completions.create(
+                    model="qwen3-max",
+                    messages=prompt_messages,
+                    tools=tool_schema,
+                    stream=True,
+                    temperature=0.4,
+                    max_tokens=1024
+                )
+                
+            stream = await asyncio.to_thread(run_llm_sync)
             
             print(f"[AgentLoop] Receiving stream...")
             for chunk in stream:
@@ -540,7 +565,9 @@ Alternative approach: [What I'll try instead]
                 try:
                     from .answer_synthesis import verify_and_clean_answer
                     print(f"[Agent] Triggering Answer Cleaning & Verification... Query: {user_query[:50]}...")
-                    cleaned = verify_and_clean_answer(content_buffer, user_query)
+                    # verify_and_clean_answer is sync (LLM call), wrap it
+                    import asyncio
+                    cleaned = await asyncio.to_thread(verify_and_clean_answer, content_buffer, user_query)
                     
                     if cleaned.startswith("ERROR:"):
                         print(f"[Agent] Answer cleaning failed: {cleaned}")
@@ -563,10 +590,12 @@ Alternative approach: [What I'll try instead]
             "step_index": current_step # Step index increments in executor or after tool
         }
 
-    def tools_node(state: AgentState) -> dict:
+    async def tools_node(state: AgentState) -> dict:
         # Execute tools using existing logic
         # execute_tools_logic returns updated state with new messages and emitted chunks
-        result = execute_tools_logic(state, tool_functions_map, memory)
+        # If execute_tools_logic is sync, wrap it
+        import asyncio
+        result = await asyncio.to_thread(execute_tools_logic, state, tool_functions_map, memory)
         return result
 
     def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
@@ -621,9 +650,11 @@ Alternative approach: [What I'll try instead]
         # To be safe and compatible with the fact that `client` is sync in my code:
         # I will use sync `app.stream`.
         
-        iterator = app.stream(initial_state, stream_mode="updates")
+        # UPDATE: Since nodes are now async, we MUST use astream
         
-        for output in iterator:
+        iterator = app.astream(initial_state, stream_mode="updates")
+        
+        async for output in iterator:
             # Output is a dict of {node_name: state_update}
             for node_name, state_update in output.items():
                 if "emitted" in state_update:
