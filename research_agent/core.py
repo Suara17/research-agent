@@ -2,7 +2,17 @@ import os
 import json
 import hashlib
 import time
-from typing import List, Callable, Optional, AsyncIterator, cast, TypedDict, Annotated, Union, Literal
+from typing import (
+    List,
+    Callable,
+    Optional,
+    AsyncIterator,
+    cast,
+    TypedDict,
+    Annotated,
+    Union,
+    Literal,
+)
 from langgraph.graph import StateGraph, END
 from openai.types.chat import ChatCompletionChunk
 
@@ -23,13 +33,9 @@ except ImportError:
             discover_skills,
         )
     except ImportError:
-        pass 
+        pass
 
-from .utils import (
-    get_llm_client, 
-    clean_answer,
-    function_to_schema
-)
+from .utils import get_llm_client, clean_answer, function_to_schema
 from .memory import MemoryStore
 from .state import StateStore
 from .schema import ToolCall, Chunk, make_json_serializable
@@ -149,6 +155,8 @@ MULTI_HOP_SYSTEM_PROMPT = """<instruction>
     <trigger>假设链太长 (3 次假设规则): 当前路径依赖于 3 个以上未验证的假设</trigger>
     <trigger>循环搜索: 搜索相同的关键词无改进</trigger>
     <trigger>精确特征不匹配: 找到匹配部分约束但未通过精确数字/特征匹配的候选者</trigger>
+    <trigger important="true">验证条件失败 (3次规则): 某个验证条件尝试3次仍失败，但已找到候选答案</trigger>
+    <trigger important="true">多路径失败: 多条验证路径都失败，需要回溯检查已找到的候选答案</trigger>
   </triggers>
   
   <decision_tree>
@@ -237,6 +245,7 @@ MULTI_HOP_SYSTEM_PROMPT = """<instruction>
 </final_instruction>
 </instruction>"""
 
+
 class AgentState(TypedDict):
     messages: List[dict]
     plan: str
@@ -246,22 +255,23 @@ class AgentState(TypedDict):
     emitted: List[Chunk]
     meta: dict
 
+
 def _sanitize_messages(messages: list) -> list:
     # Simple sanitization if needed
     return messages
+
 
 async def agent_loop(
     input_messages: list,
     tool_functions: List[Callable],
     skill_directories: Optional[List[str]] = ["skills"],
     max_steps: int = 30,
-    inherited_memory: Optional['MemoryStore'] = None,
+    inherited_memory: Optional["MemoryStore"] = None,
     inherited_context: Optional[str] = None,
 ) -> AsyncIterator[Chunk]:
-    
     assert os.getenv("IFLOW_API_KEY"), "IFLOW_API_KEY is not set"
     client = get_llm_client(timeout=30.0)
-    
+
     # Initialize Memory
     if inherited_memory:
         memory = inherited_memory
@@ -271,21 +281,23 @@ async def agent_loop(
         memory.build_index()
 
     # Initialize Skills
-    skills: List[SkillMetadata] = discover_skills(skill_directories) if skill_directories else []
+    skills: List[SkillMetadata] = (
+        discover_skills(skill_directories) if skill_directories else []
+    )
     skills_prompt = build_skills_system_prompt(skills)
-    
+
     llm_tools = (tool_functions or []).copy()
     if skills:
         skill_tools = SkillIntegrationTools(skills)
         llm_tools.extend([skill_tools.load_skill_file, skill_tools.execute_script])
-    
+
     # Add memory query tool
     def memory_query(query: str, top_k: int = 5) -> str:
         hits = memory.search(query, top_k=top_k)
         return json.dumps({"results": hits}, ensure_ascii=False)
-    
+
     llm_tools.append(memory_query)
-    
+
     tool_schema = [function_to_schema(tool_function) for tool_function in llm_tools]
     tool_functions_map = {func.__name__: func for func in llm_tools}
 
@@ -300,18 +312,19 @@ async def agent_loop(
 
     # Define nodes as async to allow async execution within LangGraph if supported
     # Even if LangGraph executes them, we need to ensure blocking calls inside are handled.
-    
+
     async def planner_node(state: AgentState) -> dict:
         # Generate initial plan
         # generate_plan uses sync client, wrap it
         import asyncio
+
         plan_data = await asyncio.to_thread(generate_plan, user_query)
-        
+
         plan = plan_data.get("plan", "")
         recommended_steps = plan_data.get("max_steps", 30)
-        
+
         print(f"[Planner] Plan created. Recommended steps: {recommended_steps}")
-        
+
         # Emit plan chunk if needed (optional)
         # emitted = [Chunk(step_index=0, type="text", content=f"Created Plan:\n{plan}\n")]
         return {"plan": plan, "max_steps": recommended_steps}
@@ -319,17 +332,17 @@ async def agent_loop(
     async def agent_node(state: AgentState) -> dict:
         current_step = state["step_index"]
         limit = state.get("max_steps", max_steps)
-        
+
         if current_step >= limit:
-            return {"pending_tool_calls": [], "emitted": []} # Stop
+            return {"pending_tool_calls": [], "emitted": []}  # Stop
 
         messages = state["messages"]
         plan = state["plan"]
-        
+
         # Inject Context (Memory + Plan)
         # We construct a temporary message list for LLM call
         prompt_messages = messages[:]
-        
+
         # Urgency & Drift Detection
         urgency_msg = ""
         try:
@@ -347,11 +360,8 @@ async def agent_loop(
                     "  </instructions>\n"
                     "</urgency_mode>"
                 )
-                prompt_messages.append({
-                    "role": "system",
-                    "content": urgency_msg
-                })
-                
+                prompt_messages.append({"role": "system", "content": urgency_msg})
+
         except Exception as e:
             print(f"[UrgencyCheck] Error: {e}")
 
@@ -359,7 +369,7 @@ async def agent_loop(
         system_prompt_addition = ""
         if skills_prompt:
             system_prompt_addition += f"\n\n{skills_prompt}"
-        
+
         system_prompt_addition += f"\n{MULTI_HOP_SYSTEM_PROMPT}"
 
         system_prompt_addition += """
@@ -403,16 +413,18 @@ async def agent_loop(
 <condition>找到候选者但精确数字不匹配</condition>
 <condition>做出 >2 个未验证假设</condition>
 <condition>歧义短语未消歧</condition>
+<condition important="true">已找到候选答案，但某条件验证失败超过 3 次：此时必须回溯记录候选答案，然后尝试其他路径</condition>
+<condition important="true">多条验证路径都失败：回溯检查之前找到的候选答案是否满足主要约束</condition>
 
 <output_template>
 BACKTRACKING: [Reason]
-Returning to: [Earlier decision point]
+Candidate answers found: [List of candidates]
+Checking if candidates satisfy main constraints instead of failing condition.
 Alternative approach: [What I'll try instead]
 </output_template>
 </forced_backtrack>
 """
 
-        
         system_prompt_addition += """
 <dynamic_strategy>
 <role>专家自主研究员</role>
@@ -426,6 +438,8 @@ Alternative approach: [What I'll try instead]
   <rule>转向策略：如果无法验证一个条件（例如，未找到具体日期），立即切换到验证其他条件以三角定位答案。不要卡在单个缺失的细节上。</rule>
   <rule>立即切换到不同的搜索词、不同的约束或更广泛的类别。</rule>
   <rule>你自己决定何时转向。</rule>
+  <rule important="true">验证次数上限：当某个验证条件尝试3次仍失败时，必须记录已找到的候选答案（如有），然后尝试其他验证路径或直接输出候选答案。</rule>
+  <rule important="true">回溯到候选答案：如果多条验证路径都失败，回溯检查之前找到的候选答案是否符合主要约束。</rule>
 </principle>
 <principle name="完成">
   <rule>一旦你有足够的信息（>=5 个来源），并保证大部分信息符合题目描述和题目要求，立即输出 "Final Answer"。</rule>
@@ -443,32 +457,44 @@ Alternative approach: [What I'll try instead]
         mem_hits = memory.search(user_query, top_k=4)
         if mem_hits:
             joined = "\n".join([(hit.get("text") or "")[:500] for hit in mem_hits])
-            prompt_messages.insert(1, {"role": "system", "content": f"<memory_context>\n{joined}\n</memory_context>"})
+            prompt_messages.insert(
+                1,
+                {
+                    "role": "system",
+                    "content": f"<memory_context>\n{joined}\n</memory_context>",
+                },
+            )
 
         # Update System Message
         if prompt_messages and prompt_messages[0].get("role") == "system":
             prompt_messages[0]["content"] += system_prompt_addition
         else:
-            prompt_messages.insert(0, {"role": "system", "content": f"{DEFAULT_SYSTEM_PROMPT}{system_prompt_addition}"})
+            prompt_messages.insert(
+                0,
+                {
+                    "role": "system",
+                    "content": f"{DEFAULT_SYSTEM_PROMPT}{system_prompt_addition}",
+                },
+            )
 
         # Call LLM
         emitted = []
         tool_calls_buffer = {}
         content_buffer = ""
-        
+
         try:
             print(f"[AgentLoop] Sending request to LLM (Model: qwen3-max)...")
-            
+
             # Use asyncio.to_thread to run sync LLM call in a separate thread
             # This prevents blocking the event loop and allows parallelism
             import asyncio
             from functools import partial
-            
+
             # Wrapper for the sync generator to consume it and return full response
             # Since streaming across threads is complex with asyncio.to_thread,
             # we might need to consume the stream in the thread or use a different approach.
             # Simplest approach for parallelism: Run the blocking call in a thread.
-            
+
             def run_llm_sync():
                 return client.chat.completions.create(
                     model="qwen3-max",
@@ -476,74 +502,91 @@ Alternative approach: [What I'll try instead]
                     tools=tool_schema,
                     stream=True,
                     temperature=0.4,
-                    max_tokens=1024
+                    max_tokens=1024,
                 )
-                
+
             stream = await asyncio.to_thread(run_llm_sync)
-            
+
             print(f"[AgentLoop] Receiving stream...")
             for chunk in stream:
                 chunk = cast(ChatCompletionChunk, chunk)
-                if not chunk.choices: continue
+                if not chunk.choices:
+                    continue
                 delta = chunk.choices[0].delta
-                
+
                 if delta.content:
                     content_buffer += delta.content
-                    # Real-time thought logging (chunked) could be too verbose, 
+                    # Real-time thought logging (chunked) could be too verbose,
                     # but we can log the accumulated thought at the end or if it's long enough.
-                    emitted.append(Chunk(type="text", content=delta.content, step_index=current_step))
+                    emitted.append(
+                        Chunk(
+                            type="text", content=delta.content, step_index=current_step
+                        )
+                    )
                     memory.add_short(delta.content)
-                
+
                 if delta.tool_calls:
                     for tc_chunk in delta.tool_calls:
                         idx = tc_chunk.index or 0
                         if idx not in tool_calls_buffer:
                             tool_calls_buffer[idx] = {
                                 "id": tc_chunk.id or f"call_{idx}",
-                                "function": {"name": tc_chunk.function.name or "", "arguments": ""}
+                                "function": {
+                                    "name": tc_chunk.function.name or "",
+                                    "arguments": "",
+                                },
                             }
                         if tc_chunk.function.name:
-                            tool_calls_buffer[idx]["function"]["name"] = tc_chunk.function.name
+                            tool_calls_buffer[idx]["function"]["name"] = (
+                                tc_chunk.function.name
+                            )
                         if tc_chunk.function.arguments:
-                            tool_calls_buffer[idx]["function"]["arguments"] += tc_chunk.function.arguments
-                            
+                            tool_calls_buffer[idx]["function"]["arguments"] += (
+                                tc_chunk.function.arguments
+                            )
+
             # --- Enhanced Logging for Reasoning ---
             if content_buffer:
-                print(f"\n{'='*20} [Step {current_step}] Agent Thought Process {'='*20}")
+                print(
+                    f"\n{'=' * 20} [Step {current_step}] Agent Thought Process {'=' * 20}"
+                )
                 print(f"{content_buffer.strip()}")
-                print(f"{'='*60}\n")
-                            
+                print(f"{'=' * 60}\n")
+
         except Exception as e:
             print(f"[Agent] LLM Error: {e}")
-            return {"emitted": []} # Should probably retry or fail gracefully
+            return {"emitted": []}  # Should probably retry or fail gracefully
 
         # Process Tool Calls
         pending_tool_calls = []
         for idx in sorted(tool_calls_buffer.keys()):
             raw = tool_calls_buffer[idx]
-            pending_tool_calls.append({
-                "id": raw["id"],
-                "type": "function",
-                "function": {
-                    "name": raw["function"]["name"],
-                    "arguments": raw["function"]["arguments"]
+            pending_tool_calls.append(
+                {
+                    "id": raw["id"],
+                    "type": "function",
+                    "function": {
+                        "name": raw["function"]["name"],
+                        "arguments": raw["function"]["arguments"],
+                    },
                 }
-            })
-            
+            )
+
         # Update messages
         new_messages = messages[:]
         if content_buffer or pending_tool_calls:
             msg = {"role": "assistant"}
-            if content_buffer: msg["content"] = content_buffer
-            if pending_tool_calls: msg["tool_calls"] = pending_tool_calls
+            if content_buffer:
+                msg["content"] = content_buffer
+            if pending_tool_calls:
+                msg["tool_calls"] = pending_tool_calls
             new_messages.append(msg)
-
 
         # Check for verification table before Final Answer
         if "Final Answer:" in content_buffer or "最终答案:" in content_buffer:
             if "CONSTRAINT VERIFICATION TABLE" not in content_buffer:
                 print("[WARNING] Final answer without verification table!")
-                
+
                 # Force requirement to supplement verification table
                 error_msg = """
 512→⚠️ CRITICAL ERROR: You attempted to output Final Answer without a Constraint Verification Table.
@@ -559,35 +602,53 @@ Alternative approach: [What I'll try instead]
 522→Please complete the verification table now.
 523→"""
                 new_messages.append({"role": "system", "content": error_msg})
-            
+
             else:
                 # Answer Cleaning & Verification
                 try:
                     from .answer_synthesis import verify_and_clean_answer
-                    print(f"[Agent] Triggering Answer Cleaning & Verification... Query: {user_query[:50]}...")
+
+                    print(
+                        f"[Agent] Triggering Answer Cleaning & Verification... Query: {user_query[:50]}..."
+                    )
                     # verify_and_clean_answer is sync (LLM call), wrap it
                     import asyncio
-                    cleaned = await asyncio.to_thread(verify_and_clean_answer, content_buffer, user_query)
-                    
+
+                    cleaned = await asyncio.to_thread(
+                        verify_and_clean_answer, content_buffer, user_query
+                    )
+
                     if cleaned.startswith("ERROR:"):
                         print(f"[Agent] Answer cleaning failed: {cleaned}")
-                        new_messages[-1]["content"] += f"\n\n[System] Answer Verification Failed: {cleaned}"
+                        new_messages[-1]["content"] += (
+                            f"\n\n[System] Answer Verification Failed: {cleaned}"
+                        )
                     else:
                         print(f"[Agent] Answer verified and cleaned: {cleaned}")
                         # Append the verified answer
-                        new_messages[-1]["content"] += f"\n\n[System] Verified Final Answer: {cleaned}"
+                        new_messages[-1]["content"] += (
+                            f"\n\n[System] Verified Final Answer: {cleaned}"
+                        )
                         # Emit the cleaned answer so it is visible in the stream
-                        emitted.append(Chunk(type="text", content=f"\n\n[System] Verified Final Answer: {cleaned}", step_index=current_step))
-                        
+                        emitted.append(
+                            Chunk(
+                                type="text",
+                                content=f"\n\n[System] Verified Final Answer: {cleaned}",
+                                step_index=current_step,
+                            )
+                        )
+
                 except Exception as e:
                     print(f"[Agent] Answer cleaning exception: {e}")
-                    new_messages[-1]["content"] += f"\n\n[System] Answer Verification Error: {str(e)}"
+                    new_messages[-1]["content"] += (
+                        f"\n\n[System] Answer Verification Error: {str(e)}"
+                    )
 
         return {
             "messages": new_messages,
             "pending_tool_calls": pending_tool_calls,
             "emitted": emitted,
-            "step_index": current_step # Step index increments in executor or after tool
+            "step_index": current_step,  # Step index increments in executor or after tool
         }
 
     async def tools_node(state: AgentState) -> dict:
@@ -595,7 +656,10 @@ Alternative approach: [What I'll try instead]
         # execute_tools_logic returns updated state with new messages and emitted chunks
         # If execute_tools_logic is sync, wrap it
         import asyncio
-        result = await asyncio.to_thread(execute_tools_logic, state, tool_functions_map, memory)
+
+        result = await asyncio.to_thread(
+            execute_tools_logic, state, tool_functions_map, memory
+        )
         return result
 
     def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
@@ -605,27 +669,22 @@ Alternative approach: [What I'll try instead]
 
     # --- Graph Construction ---
     workflow = StateGraph(AgentState)
-    
+
     workflow.add_node("planner", planner_node)
     workflow.add_node("agent", agent_node)
     workflow.add_node("tools", tools_node)
-    
+
     workflow.add_edge("__start__", "planner")
     workflow.add_edge("planner", "agent")
-    
+
     workflow.add_conditional_edges(
-        "agent",
-        should_continue,
-        {
-            "tools": "tools",
-            "__end__": END
-        }
+        "agent", should_continue, {"tools": "tools", "__end__": END}
     )
-    
+
     workflow.add_edge("tools", "agent")
-    
+
     app = workflow.compile()
-    
+
     # --- Execution Loop ---
     initial_state = {
         "messages": input_messages,
@@ -633,35 +692,36 @@ Alternative approach: [What I'll try instead]
         "step_index": 0,
         "pending_tool_calls": [],
         "emitted": [],
-        "meta": {"searched_keywords": []}
+        "meta": {"searched_keywords": []},
     }
-    
+
     # We use stream_mode="updates" to get state updates from each node
     # Note: 'astream' might not be available if LangGraph version is old or specific.
     # Assuming standard LangGraph usage.
-    
+
     try:
         # Using synchronous invoke/stream in loop if astream is problematic with async generator?
         # Actually agent_loop is async. LangGraph supports async nodes if defined async.
         # But my nodes are sync (calling sync client).
         # So I should use app.stream (sync iterator) but agent_loop is async generator.
         # I can wrap it.
-        
+
         # To be safe and compatible with the fact that `client` is sync in my code:
         # I will use sync `app.stream`.
-        
+
         # UPDATE: Since nodes are now async, we MUST use astream
-        
+
         iterator = app.astream(initial_state, stream_mode="updates")
-        
+
         async for output in iterator:
             # Output is a dict of {node_name: state_update}
             for node_name, state_update in output.items():
                 if "emitted" in state_update:
                     for chunk in state_update["emitted"]:
                         yield chunk
-                        
+
     except Exception as e:
         print(f"[AgentLoop] Error: {e}")
         import traceback
+
         traceback.print_exc()

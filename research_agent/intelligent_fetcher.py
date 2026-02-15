@@ -6,7 +6,7 @@ import time
 import logging
 from urllib.parse import urlparse
 from typing import Optional, Dict, Any
-import requests
+from curl_cffi import requests
 
 logger = logging.getLogger(__name__)
 
@@ -185,14 +185,14 @@ class IntelligentFetcher:
     def initialize_known_problematic_domains(self):
         """初始化已知的问题域名"""
         problematic_domains = [
-            'nationalminingmuseum.org.uk',  # SSL频繁失败
-            'www.nationalminingmuseum.org.uk',
-            'instagram.com',  # 连接超时
-            'www.instagram.com',
-            'facebook.com',  # 连接超时
-            'www.facebook.com',
-            'www.cia.gov',  # 已有黑名单
-            'www.state.gov',  # 已有黑名单
+            # 'nationalminingmuseum.org.uk',  # SSL频繁失败 - 注释掉以允许访问
+            # 'www.nationalminingmuseum.org.uk',
+            # 'instagram.com',  # 连接超时 - 注释掉以允许访问
+            # 'www.instagram.com',
+            # 'facebook.com',  # 连接超时 - 注释掉以允许访问
+            # 'www.facebook.com',
+            # 'www.cia.gov',  # 已有黑名单 - 注释掉以允许访问
+            # 'www.state.gov',  # 已有黑名单 - 注释掉以允许访问
         ]
 
         for domain in problematic_domains:

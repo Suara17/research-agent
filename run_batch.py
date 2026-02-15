@@ -11,7 +11,7 @@ from typing import Any, Dict, List
 
 from research_agent.core import agent_loop
 from research_agent.search import web_search, web_fetch, get_weather, browse_page, x_keyword_search, search_pdf_attachment, browse_pdf_attachment
-from research_agent.utils import clean_answer
+from research_agent.answer_synthesis import verify_and_clean_answer, synthesize_best_answer
 from agent import QueryRequest
 
 logging.basicConfig(
@@ -102,7 +102,7 @@ async def run_one(
     Returns: (answer, memory, search_summary, need_retry)
     """
     req = QueryRequest(question=question)
-    messages = req.to_messages()
+    base_messages = req.to_messages()
 
     if is_retry:
         max_steps = 15
@@ -113,7 +113,7 @@ async def run_one(
 
     if rejection_history:
         hint_text = "\n\n".join(rejection_history)
-        messages.append({
+        base_messages.append({
             "role": "system",
             "content": f"""SYSTEM REMINDER: Previous verification FAILED.
 
@@ -123,69 +123,103 @@ PREVIOUS REJECTIONS:
 INSTRUCTION: Analyze the rejection reasons. Change your search strategy to avoid repeating mistakes."""
         })
 
-    result = ""
-    skill_usage_log = []
-    search_summary_parts = []
-
     tools = [web_search, web_fetch, get_weather, browse_page, x_keyword_search, search_pdf_attachment, browse_pdf_attachment]
 
-    final_memory = None
+    # Configure number of agents to run in parallel
+    num_agents = int(os.environ.get("NUM_AGENTS", "1"))
+    if num_agents < 1: num_agents = 1
+
+    logging.info(f"[Single-Agent] Starting {num_agents} agent via API for batch QID...")
+
+    async def run_single_agent(agent_id: int, tools: list):
+        # Create a fresh copy of messages for each agent
+        messages = json.loads(json.dumps(base_messages)) # Deep copy to be safe
+        
+        raw_result = ""
+        skill_usage_log = []
+        search_summary_parts = []
+        final_memory = None
+        
+        try:
+            async for chunk in agent_loop(
+                messages,
+                tools,
+                max_steps=max_steps,
+                inherited_memory=inherited_memory,
+                inherited_context=inherited_context
+            ):
+                if chunk.type == "final_state":
+                    final_memory = chunk.tool_result
+
+                if chunk.type == "tool_call":
+                    tool_name = chunk.tool_call.tool_name if chunk.tool_call else "unknown"
+                    tool_args = chunk.tool_call.tool_arguments if chunk.tool_call else {}
+                    if tool_name == "web_search":
+                        query = tool_args.get("query", "")
+                        search_summary_parts.append(f"[Agent {agent_id}] Searched: {query}")
+                    if tool_name == "load_skill_file":
+                        skill_name = tool_args.get("skill_name", "unknown")
+                        skill_usage_log.append(f"load:{skill_name}")
+                    elif tool_name == "execute_script":
+                        skill_name = tool_args.get("skill_name", "unknown")
+                        skill_usage_log.append(f"execute:{skill_name}")
+
+                elif chunk.type == "tool_call_result":
+                    tool_name = chunk.tool_call.tool_name if chunk.tool_call else "unknown"
+                    if tool_name == "web_search" and chunk.tool_result:
+                        try:
+                            if isinstance(chunk.tool_result, str) and "Found:" in chunk.tool_result:
+                                search_summary_parts.append(chunk.tool_result[:100])
+                        except:
+                            pass
+
+                elif chunk.type == "text" and chunk.content:
+                    raw_result += chunk.content
+            
+            if skill_usage_log:
+                logging.info(f"[Agent {agent_id}] Skills used: {', '.join(skill_usage_log)}")
+            
+            # Clean individual result
+            cleaned_ans = ""
+            if raw_result:
+                cleaned_ans = verify_and_clean_answer(raw_result, question)
+                
+            return {
+                "id": agent_id,
+                "trace": raw_result,
+                "answer": cleaned_ans,
+                "memory": final_memory,
+                "search_summary": "\n".join(search_summary_parts)
+            }
+        except Exception as e:
+            logging.error(f"[Agent {agent_id}] Failed: {e}")
+            return {
+                "id": agent_id,
+                "trace": raw_result + f"\n\n[System Error]: {str(e)}",
+                "answer": "",
+                "memory": None,
+                "search_summary": ""
+            }
+
+    tasks = [run_single_agent(i+1, tools) for i in range(num_agents)]
+    agent_results = await asyncio.gather(*tasks)
     
-    async for chunk in agent_loop(
-        messages,
-        tools,
-        max_steps=max_steps,
-        inherited_memory=inherited_memory,
-        inherited_context=inherited_context
-    ):
-        if chunk.type == "final_state":
-            final_memory = chunk.tool_result
-
-        if chunk.type == "tool_call":
-            tool_name = chunk.tool_call.tool_name if chunk.tool_call else "unknown"
-            tool_args = chunk.tool_call.tool_arguments if chunk.tool_call else {}
-
-            if tool_name == "web_search":
-                query = tool_args.get("query", "")
-                search_summary_parts.append(f"Searched: {query}")
-
-            if tool_name == "load_skill_file":
-                skill_name = tool_args.get("skill_name", "unknown")
-                logging.info(f"[SKILL] Loading skill: {skill_name}")
-                skill_usage_log.append(f"load:{skill_name}")
-            elif tool_name == "execute_script":
-                skill_name = tool_args.get("skill_name", "unknown")
-                skill_args = tool_args.get("args", {})
-                logging.info(f"[SKILL] Executing skill: {skill_name} with args: {json.dumps(skill_args, ensure_ascii=False)[:100]}")
-                skill_usage_log.append(f"execute:{skill_name}")
-
-        elif chunk.type == "tool_call_result":
-            tool_name = chunk.tool_call.tool_name if chunk.tool_call else "unknown"
-            if tool_name in ("load_skill_file", "execute_script"):
-                result_preview = str(chunk.tool_result)[:200] if chunk.tool_result else "empty"
-                logging.info(f"[SKILL] Result from {tool_name}: {result_preview}")
-
-            if tool_name == "web_search" and chunk.tool_result:
-                try:
-                    if isinstance(chunk.tool_result, str) and "Found:" in chunk.tool_result:
-                        search_summary_parts.append(chunk.tool_result[:100])
-                except:
-                    pass
-
-        elif chunk.type == "text" and chunk.content:
-            result += chunk.content
-
-    if skill_usage_log:
-        logging.info(f"[SKILL_SUMMARY] Skills used: {', '.join(skill_usage_log)}")
-    else:
-        logging.warning("[SKILL_SUMMARY] No skills were used in this iteration")
+    logging.info(f"[Multi-Agent] All {len(agent_results)} agents finished. Synthesizing best answer...")
     
-    if result:
-        result = clean_answer(result)
+    # Synthesize
+    final_answer = synthesize_best_answer(question, agent_results)
+    
+    # Combine summaries and find last memory
+    combined_summary = ""
+    last_memory = None
+    
+    for res in agent_results:
+        agent_id = res["id"]
+        combined_summary += f"\n[Agent {agent_id} Summary]\n{res['search_summary']}"
+        if res["memory"]:
+            last_memory = res["memory"]
 
-    search_summary = "\n".join(search_summary_parts[-10:]) if search_summary_parts else ""
-
-    return (result, final_memory, search_summary, False) # No internal retry logic needed from validation script
+    return (final_answer, last_memory, combined_summary, False)
 
 async def run_with_policy(qid: int, question: str, stats: Dict[str, int]) -> str:
     last_err = None
@@ -260,6 +294,7 @@ async def run_with_policy(qid: int, question: str, stats: Dict[str, int]) -> str
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--question_id", type=int, help="Run specific question ID")
+    parser.add_argument("--force", action="store_true", help="Force re-run even if already processed")
     args = parser.parse_args()
 
     src = "question.jsonl"
@@ -316,7 +351,7 @@ async def main():
     for it in items:
         qid = int(it.get("id") or 0)
         
-        if qid in processed_ids:
+        if qid in processed_ids and not args.force:
             if args.question_id is not None:
                 logging.info(f"Force running question {qid} (explicitly requested)")
             else:

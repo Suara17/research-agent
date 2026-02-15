@@ -2,9 +2,9 @@ import os
 import re
 import json
 import inspect
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from curl_cffi import requests
+# from requests.adapters import HTTPAdapter
+# from urllib3.util.retry import Retry
 from typing import Callable, Any, List, Union, Literal, Optional, get_origin, get_args, get_type_hints
 from dataclasses import dataclass
 from openai import OpenAI
@@ -16,40 +16,18 @@ from openai import OpenAI
 import random
 
 def get_session() -> requests.Session:
-    session = requests.Session()
-    retry_strategy = Retry(
-        total=3,  # Increased from 2 to 3 for better robustness
-        backoff_factor=1.0, # Increased from 0.5 to 1.0
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=10)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
+    # Use curl_cffi Session with Chrome impersonation for better anti-detection
+    session = requests.Session(impersonate="chrome124")
     
-    # User-Agent Rotation List
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:122.0) Gecko/20100101 Firefox/122.0",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/121.0.0.0 Safari/537.36"
-    ]
+    # User-Agent Rotation List (kept for reference, but impersonate handles it mostly)
+    # We can still set some custom headers if needed, but be careful not to break the impersonation profile.
+    # Generally, with impersonate, we should let it handle the headers.
     
-    session.headers.update(
-        {
-            "User-Agent": random.choice(user_agents),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Ch-Ua": '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"Windows"',
-        }
-    )
+    # However, setting Accept-Language might be useful.
+    session.headers.update({
+        "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+    })
+    
     return session
 
 # -------------------------------------------------------------------------
