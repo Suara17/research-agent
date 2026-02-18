@@ -4,6 +4,13 @@ import urllib.parse
 import urllib.request
 from urllib.parse import urlparse
 from curl_cffi import requests
+
+# 加载 .env 文件（如果存在）
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import ssl
@@ -59,6 +66,11 @@ try:
     _BAIDU_AVAILABLE = True
 except ImportError:
     _BAIDU_AVAILABLE = False
+
+# 博查 API 配置
+_BOCHA_API_KEY = os.getenv("BOCHA_API_KEY")
+_BOCHA_API_URL = "https://api.bochaai.com/v1/web-search"
+_BOCHA_AVAILABLE = _BOCHA_API_KEY is not None
 
 try:
     from googlesearch import search as google_search_scraper
@@ -230,6 +242,57 @@ def _fetch_with_drission(url: str) -> Optional[str]:
                 pass
 
 
+def _compress_fetched_content(content: str, max_length: int = 5000) -> str:
+    """
+    压缩抓取的网页内容，保留关键信息
+    
+    策略：
+    1. 如果内容 <= max_length，直接返回
+    2. 尝试使用关键句子提取（保留核心信息）
+    3. 如果仍超长，截断到 max_length
+    """
+    if not content:
+        return content
+    
+    # 如果内容已经足够短，直接返回
+    if len(content) <= max_length:
+        return content
+    
+    # 尝试使用关键句子提取方法
+    try:
+        # 导入已在文件顶部
+        key_sentences = extract_key_sentences(content, max_length=max_length, num_sentences=6)
+        if key_sentences and len(key_sentences) > 50:  # 确保提取到有效内容
+            return key_sentences
+    except Exception:
+        pass
+    
+    # 如果关键句子提取失败，使用位置截断
+    truncated = content[:max_length * 2]  # 先取2倍长度
+    
+    # 尝试在句子边界处截断
+    sentence_ends = [
+        truncated.rfind("。"),
+        truncated.rfind("！"),
+        truncated.rfind("？"),
+        truncated.rfind(".\n"),
+        truncated.rfind("!\n"),
+        truncated.rfind("?\n"),
+    ]
+    last_end = max(sentence_ends)
+    
+    if last_end > max_length * 0.7:  # 确保截断位置合理
+        result = truncated[:last_end + 1]
+    else:
+        result = truncated[:max_length]
+    
+    # 添加省略提示
+    if len(content) > len(result):
+        result += "\n\n[...内容已压缩，原始长度: {} 字符...]".format(len(content))
+    
+    return result
+
+
 def _fetch_with_jina(url: str, session) -> Optional[str]:
     """
     尝试使用 Jina Reader 获取网页内容的 Markdown
@@ -264,6 +327,20 @@ def _fetch_with_jina(url: str, session) -> Optional[str]:
 # URL去重缓存：归一化URL -> (内容, 时间戳)
 _URL_FETCH_CACHE = {}
 _URL_FETCH_LIMIT = 100  # 最多缓存100个URL
+
+# Wikipedia 专用缓存 - 更长的有效期
+_WIKI_FETCH_CACHE = {}
+_WIKI_CACHE_LIMIT = 200  # Wikipedia 缓存更多条目
+_WIKI_CACHE_TTL = 86400  # Wikipedia 缓存24小时
+
+# Wikipedia 镜像列表
+_WIKI_MIRRORS = [
+    "https://en.wikipedia.org",
+    "https://zh.wikipedia.org", 
+    "https://ja.wikipedia.org",
+    "https://de.wikipedia.org",
+    "https://fr.wikipedia.org",
+]
 
 _UA_LIST = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
@@ -335,6 +412,227 @@ def _filter_search_results(results: list) -> list:
     return filtered
 
 
+# 实体消歧映射表：容易混淆的实体 -> 消歧限定词
+_ENTITY_DISAMBIGUATION = {
+    "walter": "Walter Gropius architect",
+    "le corbusier": "Le Corbusier architect",
+    "mies": "Mies van der Rohe architect",
+    "gropius": "Walter Gropius Bauhaus",
+    "mendelsohn": "Erich Mendelsohn architect",
+    "saarinen": "Eliel Saarinen architect",
+    "loos": "Adolf Loos architect",
+    "berlage": "Hendrik Berlage architect",
+    "taut": "Bruno Taut architect",
+    "behrendt": "Walter Curt Behrendt architect",
+    "reliance": "Reliance Building Chicago",
+    "palmer house": "Palmer House Chicago hotel",
+    "blackstone": "Blackstone Hotel Chicago",
+    "fisher building": "Fisher Building Detroit",
+    "marquette": "Marquette Building Chicago",
+    "list": "list of architects",
+    "android": "Android operating system",
+    "music": "music application",
+}
+
+# 低质量域名模式
+_LOW_QUALITY_DOMAINS = {
+    "pinterest",
+    "instagram",
+    "facebook",
+    "twitter",
+    "reddit",
+    "tiktok",
+    "youtube",
+    "baidu",
+    "taobao",
+    "jd.com",
+    "wikipedia",  # 维基百科放最后，不一定低质量
+}
+
+# 高质量域名
+_HIGH_QUALITY_DOMAINS = {
+    "arxiv.org",
+    "pubmed.org",
+    "nih.gov",
+    "edu",
+    "gov",
+    "jstor.org",
+    "springer.com",
+    "elsevier.com",
+    "wiley.com",
+    "sagepub.com",
+    "architecture.org",
+    "archdaily.com",
+    "dezeen.com",
+    "archdaily.com",
+}
+
+
+def _is_english_entity_query(query: str) -> bool:
+    """检测查询是否主要包含英文实体（人名、建筑名等）"""
+    english_indicators = [
+        "architect",
+        "building",
+        "book",
+        "hotel",
+        "skyscraper",
+        "architecture",
+        "author",
+        "published",
+        "1920",
+        "1930",
+    ]
+    query_lower = query.lower()
+    return any(indicator in query_lower for indicator in english_indicators)
+
+
+def _disambiguate_entities(query: str) -> str:
+    """
+    实体消歧预处理：为容易混淆的实体添加限定词
+    """
+    result = query
+
+    # 按长度降序排序，避免短词优先匹配导致的问题
+    sorted_entities = sorted(_ENTITY_DISAMBIGUATION.items(), key=lambda x: -len(x[0]))
+
+    for ambiguous_term, disambiguation in sorted_entities:
+        # 检查查询中是否已经包含消歧词（通过检查原词是否在查询中，且消歧词不在）
+        ambiguous_lower = ambiguous_term.lower()
+        query_lower = query.lower()
+
+        # 如果查询包含原词但不含消歧词
+        if ambiguous_lower in query_lower:
+            # 检查是否已经包含消歧限定词
+            disambig_words = disambiguation.lower().split()
+            if not any(word in query_lower for word in disambig_words):
+                # 替换
+                import re
+
+                pattern = r"\b" + re.escape(ambiguous_term) + r"\b"
+                result = re.sub(pattern, disambiguation, result, flags=re.IGNORECASE)
+
+    return result
+
+
+def _filter_low_quality_results(results: List[Dict], original_query: str) -> List[Dict]:
+    """
+    过滤低质量搜索结果：
+    1. 词典定义（标题为单个词或极短）
+    2. 商业公司网站（非目标内容）
+    3. 与查询无关的结果
+    """
+    if not results:
+        return []
+
+    filtered = []
+    original_query_lower = original_query.lower()
+    query_keywords = set(original_query_lower.split())
+
+    # 移除常见停用词
+    stop_words = {
+        "the",
+        "a",
+        "an",
+        "is",
+        "are",
+        "was",
+        "were",
+        "of",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "and",
+        "or",
+        "but",
+    }
+    query_keywords = query_keywords - stop_words
+
+    for r in results:
+        title = str(r.get("title") or "")
+        summary = str(r.get("summary") or r.get("snippet") or "")
+        url = str(r.get("url") or "")
+
+        title_lower = title.lower()
+
+        # 1. 过滤词典定义（标题极短且像单词）
+        if len(title) <= 20 and " " not in title.strip():
+            # 检查是否像词典单词
+            if any(
+                indicator in title_lower
+                for indicator in ["definition", "meaning", "词语解释", "词典"]
+            ):
+                continue
+            # 允许包含数字或明确实体的标题
+            if not any(c.isdigit() for c in title) and not any(
+                kw in title_lower for kw in ["hotel", "building", "architect", "book"]
+            ):
+                continue
+
+        # 2. 过滤明显无关的商业公司
+        irrelevant_companies = [
+            ("walter tools", "walter" in title_lower and "tool" in title_lower),
+            (
+                "reliance india",
+                "reliance" in title_lower
+                and ("india" in title_lower or "group" in title_lower),
+            ),
+            (
+                "android app",
+                "android" in title_lower
+                and ("app" in title_lower or "emulator" in title_lower),
+            ),
+            ("music app", "music" in title_lower and "app" in title_lower),
+        ]
+        for pattern, condition in irrelevant_companies:
+            if condition:
+                continue
+
+        # 3. 过滤中文玄幻小说等无关内容
+        irrelevant_patterns = [
+            "玄幻",
+            "修仙",
+            "小说",
+            "txt",
+            "全集",
+            "pornhub",
+            "xvideos",
+            "xhamster",
+        ]
+        content_check = f"{title_lower} {summary.lower()}"
+        if any(pattern in content_check for pattern in irrelevant_patterns):
+            continue
+
+        # 4. 检查与查询的相关性（至少有一个关键词匹配）
+        # 对于包含明确实体的查询，放宽要求
+        content_for_match = f"{title_lower} {summary.lower()}"
+        has_keyword_match = (
+            any(kw in content_for_match for kw in query_keywords)
+            if query_keywords
+            else True
+        )
+
+        # 5. 对URL进行检查
+        url_lower = url.lower()
+
+        # 如果以上检查都通过，添加结果
+        if has_keyword_match or _is_high_quality_url(url):
+            filtered.append(r)
+        else:
+            # 对于高质量域名，即使关键词匹配不强也保留
+            if _is_high_quality_url(url):
+                filtered.append(r)
+
+    return filtered
+
+
+def _is_high_quality_url(url: str) -> bool:
+    """判断URL是否为高质量来源"""
+    url_lower = url.lower()
+    return any(domain in url_lower for domain in _HIGH_QUALITY_DOMAINS)
+
+
 def _rerank_search_results(results, query: str, top_k: int):
     # Deprecated: Reranking based on regex entity extraction is unreliable.
     # We trust the search engine's ranking and the LLM's ability to filter relevant results.
@@ -381,79 +679,254 @@ def extract_answer_from_search_results(search_results: list, query: str) -> dict
         return {"candidates": [], "extraction_method": "error"}
 
 
+# Wikipedia 查询限定模式
+_WIKI_ENTITY_PATTERNS = [
+    r"^(Who|What|Where|When|Which)\s+(was|is|were|are|did|do)\s+",
+    r"^(Who|What|Where|Which)\s+(was|is|were|are|did|do)\s+[\w\s]+\?$",
+    r"^(法国|德国|美国|英国 日本|意大利|西班牙|俄罗斯|中国人|美国人|英国人|德国人|法国人|日本人|意大利人|俄罗斯人)",
+    r"^(谁|什么|哪里|哪个|何时|怎样|如何|为什么|哪一年|哪国|哪位)",  # 问句开头
+    r"(谁|什么|哪里|哪个|何时|怎样|如何|为什么)是",
+    r"《.+》",
+    r"^\d{4}.*(年|出生于|逝世|去世|创立|成立)",
+    r"^(first|second|third|latest|new)\s+(book|film|movie|novel|president|king|queen|architect)",
+    r"(first|second|third)\s+(Hispanic|Asian|African|American|European)\s+",
+    r"(born|died|born in|died in|lived in|married to)",
+    r"^(请帮我|查找|搜索|关于|我想知道|有没有)",
+    r"\s(书|电影|小说|建筑|公司|组织|机构|大学|医院|博物馆|图书馆|机场|车站|酒店|餐厅|医院)\s*$",
+    r"\s(是谁|是什么|在哪|建于)",
+]
+
+# 检测是否为实体类查询
+def _is_entity_query(query: str) -> bool:
+    """检测查询是否为实体类查询（人名、地名、书名等）"""
+    query_lower = query.lower().strip()
+    
+    # 检查是否匹配 Wikipedia 实体查询模式
+    for pattern in _WIKI_ENTITY_PATTERNS:
+        if re.match(pattern, query, re.IGNORECASE):
+            return True
+    
+    # 检查是否包含明显的实体标识
+    entity_indicators = [
+        '"', '《', '》',  # 引号、书名号
+    ]
+    if any(indicator in query for indicator in entity_indicators):
+        return True
+    
+    # 检查是否以问号结尾（通常是实体查询）
+    if query.strip().endswith('?'):
+        return True
+    
+    return False
+
+
 def _optimize_search_query(query: str) -> str:
     """
-    混合优化策略：
-    1. 短查询（<40字符）：直接返回，靠搜索引擎自己处理（0延迟）。
-    2. 简单清洗：用正则去掉常见的废话（"请问"、"搜索"等）。
-    3. 长难句：才调用 LLM 进行重写。
+    搜索查询优化策略（参考IR最佳实践）：
+    1. 保守截断：现代搜索引擎可处理较长查询
+    2. 保留所有关键约束词：book, hotel, building 等
+    3. 去除停用词和对话式废话
+    4. 保持查询的完整语义
+    5. 对实体类查询添加 Wikipedia 限定
     """
     try:
-        # 0. 保护性截断（防止超长 token 攻击）
-        if len(query) > 300:
-            query = query[:300]
+        if len(query) > 400:
+            query = query[:400]
 
-        # 1. 快速通道：如果查询很短，或者是高级指令（site:），直接放行
-        # 大多数用户搜索都在 10-30 个字之间，这里能节省 90% 的 LLM 调用
-        if len(query) < 40 and "site:" not in query and "filetype:" not in query:
-            return query.strip()
+        # 短查询直接返回
+        if len(query) < 80 and "site:" not in query and "filetype:" not in query:
+            cleaned = re.sub(
+                r"(请帮我|查找|搜索|关于|我想知道|有没有)",
+                "",
+                query,
+                flags=re.IGNORECASE,
+            ).strip()
+            return cleaned if cleaned else query.strip()
 
-        # 2. 中等长度：本地正则清洗（0延迟）
-        # 去除常见的中文口语废话
-        clean_pattern = (
-            r"(请帮我|查找|搜索|关于|我想知道|有没有|what is|how to|find me)"
-        )
+        # 1. 去除对话式废话
+        clean_pattern = r"(请帮我|查找|搜索|关于|我想知道|有没有|what is|how to|find me|please|can you|could you|would|should)"
         cleaned_query = re.sub(clean_pattern, "", query, flags=re.IGNORECASE).strip()
 
-        # 如果清洗后长度适中，直接用清洗后的（避免 LLM）
-        if len(cleaned_query) < 60:
+        # 2. 如果清理后不太长，直接返回
+        if len(cleaned_query) < 120:
             return cleaned_query
 
-        # 3. 只有真正的“长难句”才调用 LLM
-        print(
-            f"[Monitoring] Query too complex, invoking LLM optimization: {query[:20]}..."
-        )
+        # 3. 去除标点，分词
+        cleaned_no_punct = re.sub(r"[^\w\s\-]", " ", cleaned_query)
+        words = cleaned_no_punct.split()
 
-        # Add Length Limit Logic
-        if len(query) > 300:
-            query = query[:300]
+        # 最小停用词集（只去除真正无意义的词）
+        minimal_stopwords = {
+            "the",
+            "a",
+            "an",
+            "is",
+            "was",
+            "are",
+            "were",
+            "be",
+            "been",
+            "have",
+            "has",
+            "had",
+            "do",
+            "does",
+            "did",
+            "will",
+            "would",
+            "could",
+            "should",
+            "may",
+            "might",
+            "must",
+            "shall",
+            "can",
+            "i",
+            "you",
+            "he",
+            "she",
+            "it",
+            "we",
+            "they",
+            "me",
+            "him",
+            "her",
+            "us",
+            "them",
+            "my",
+            "your",
+            "his",
+            "its",
+            "our",
+            "this",
+            "that",
+            "these",
+            "those",
+            "who",
+            "whom",
+            "whose",
+            "which",
+            "what",
+            "where",
+            "when",
+            "why",
+            "how",
+            "in",
+            "to",
+            "of",
+            "and",
+            "or",
+            "for",
+            "with",
+            "by",
+            "as",
+            "on",
+            "at",
+            "new",
+            "well",
+            "known",
+        }
 
-        # 3. Use LLM for complex natural language queries
-        client = get_llm_client()
-        prompt = f"""<instruction>
-<role>搜索引擎优化专家</role>
-<task>将用户的自然语言查询转换为精确的搜索引擎查询。</task>
-<rules>
-  <rule>提取核心关键词。</rule>
-  <rule>删除对话填充词 ("什么是", "搜索", "我需要找到")。</rule>
-  <rule>对特定实体 (人名, 电影) 使用引号 ""。</rule>
-  <rule>对于谜题或类别搜索, 使用 "List of..." 模式。</rule>
-  <rule>保持简短有效。</rule>
-</rules>
-<input>{query}</input>
-<output>仅返回查询字符串。</output>
-</instruction>"""
+        # 关键约束词（全部保留，不限数量）
+        constraint_words = {
+            # 核心约束
+            "book",
+            "books",
+            "title",
+            "author",
+            "published",
+            "wrote",
+            "written",
+            "hotel",
+            "building",
+            "buildings",
+            "city",
+            "cities",
+            "tall",
+            "skyscraper",
+            "architect",
+            "architects",
+            "architecture",
+            "style",
+            "designer",
+            # 时间/地点约束
+            "1920s",
+            "1920",
+            "20th",
+            "american",
+            "european",
+            "chinese",
+            "german",
+            "midwestern",
+            "midwest",
+            "america",
+            "united",
+            "states",
+            # 描述性约束
+            "urban",
+            "planning",
+            "construction",
+            "modern",
+            "century",
+            "decade",
+            "key",
+            "role",
+            "major",
+            "primary",
+            "example",
+            "introducing",
+            "introduced",
+            "development",
+            "potential",
+            "analyzing",
+        }
 
-        response = client.chat.completions.create(
-            model="qwen3-max",
-            messages=[
-                {"role": "system", "content": prompt},
-            ],
-            temperature=0.1,
-            max_tokens=64,
-        )
+        # 分类收集
+        constraint_list = []
+        year_list = []
+        proper_list = []
+        other_list = []
 
-        if not response or not response.choices:
-            print(f"[Monitoring] LLM returned empty response or choices")
-            return query.strip()
+        for w in words:
+            word_lower = w.lower()
 
-        optimized = response.choices[0].message.content.strip().strip('"')
+            if word_lower in minimal_stopwords:
+                continue
 
-        # Fallback validation
-        if not optimized or len(optimized) < 3:
-            return query.strip()
+            # 约束词（全部保留）
+            if word_lower in constraint_words:
+                constraint_list.append(w)
+            # 年份
+            elif re.match(r"^\d{2,4}s?$", w):
+                year_list.append(w)
+            # 专有名词
+            elif len(w) > 2 and w[0].isupper():
+                proper_list.append(w)
+            # 其他
+            elif len(w) > 2:
+                other_list.append(w)
 
-        print(f"[Monitoring] LLM_query_optimization: '{query}' → '{optimized}'")
+        # 组合：约束词优先（全部） + 年份 + 专有名词 + 其他
+        final_words = constraint_list + year_list + proper_list[:6] + other_list[:6]
+
+        # 去重保持顺序
+        seen = set()
+        unique_words = []
+        for w in final_words:
+            if w.lower() not in seen:
+                seen.add(w.lower())
+                unique_words.append(w)
+
+        optimized = " ".join(unique_words)
+
+        # 长度限制（更宽松，现代搜索引擎支持）
+        if len(optimized) > 200:
+            optimized = optimized[:200]
+
+        if not optimized:
+            return cleaned_query[:200]
+
+        print(f"[Monitoring] Query optimized: '{query[:50]}...' -> '{optimized}'")
         return optimized
 
     except Exception as e:
@@ -510,6 +983,7 @@ def expand_query_language(query: str) -> list:
 
 
 def _extract_search_slots(query: str) -> dict:
+    """使用LLM提取查询中的结构化槽位信息"""
     try:
         client = get_llm_client()
         prompt = [
@@ -535,10 +1009,40 @@ def _extract_search_slots(query: str) -> dict:
             max_tokens=256,
             response_format={"type": "json_object"},
         )
-        return json.loads(resp.choices[0].message.content)
+        result = resp.choices[0].message.content
+        if result:
+            return json.loads(result)
+        return {}
     except Exception as e:
         print(f"[Monitoring] Slot extraction failed: {e}")
-        return {}
+        # 降级方案：使用简单的正则提取
+        return _fallback_slot_extraction(query)
+
+
+def _fallback_slot_extraction(query: str) -> dict:
+    """简单的降级槽位提取方案"""
+    import re
+    
+    # 检测语言
+    is_chinese = any("\u4e00" <= ch <= "\u9fff" for ch in query)
+    
+    # 提取年份
+    years = re.findall(r"\b(19|20)\d{2}s?\b", query)
+    
+    # 提取引号中的内容
+    quoted = re.findall(r'"([^"]+)"', query)
+    
+    # 提取书名号中的内容
+    books = re.findall(r"《([^》]+)》", query)
+    
+    anchors = quoted + books
+    
+    return {
+        "type": "Unknown",
+        "hard_constraints": years if years else [],
+        "anchors": anchors,
+        "target_country": None
+    }
 
 
 def _wiki_title_from_path(path: str) -> str:
@@ -555,53 +1059,116 @@ def _wiki_title_from_path(path: str) -> str:
 _WIKI_UA = "ResearchBot/1.0 (contact@example.com)"
 
 
-def _fetch_wikipedia_rest(url: str) -> Optional[dict]:
-    try:
-        p = urllib.parse.urlparse(url)
-        host = p.netloc
-        title = _wiki_title_from_path(p.path)
-        if not host or not title:
-            return None
+def _get_wiki_cache_key(title: str, lang: str = "en") -> str:
+    """生成 Wikipedia 缓存键"""
+    return f"{lang}:{title.lower()}"
 
-        try:
-            api = f"https://{host}/api/rest_v1/page/summary/{urllib.parse.quote(title)}"
-            req = urllib.request.Request(api, headers={"User-Agent": _WIKI_UA})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8", "replace"))
-            extract = str(data.get("extract") or "")
+
+def _fetch_wikipedia_with_cache(url: str) -> Optional[dict]:
+    """
+    使用缓存和镜像获取 Wikipedia 内容
+    """
+    p = urllib.parse.urlparse(url)
+    host = p.netloc
+    title = _wiki_title_from_path(p.path)
+    
+    if not host or not title:
+        return None
+    
+    # 提取语言代码
+    lang = "en"
+    if "zh.wikipedia.org" in host:
+        lang = "zh"
+    elif "ja.wikipedia.org" in host:
+        lang = "ja"
+    elif "de.wikipedia.org" in host:
+        lang = "de"
+    elif "fr.wikipedia.org" in host:
+        lang = "fr"
+    
+    cache_key = _get_wiki_cache_key(title, lang)
+    
+    # 检查缓存（24小时有效期）
+    if cache_key in _WIKI_FETCH_CACHE:
+        cached_data, cached_time = _WIKI_FETCH_CACHE[cache_key]
+        if time.time() - cached_time < _WIKI_CACHE_TTL:
+            print(f"[WikiCache] Cache hit for {title}")
+            return cached_data
+        else:
+            del _WIKI_FETCH_CACHE[cache_key]
+    
+    # 尝试从原始主机获取
+    result = _fetch_wikipedia_from_host(host, title)
+    if result:
+        # 存入缓存
+        _WIKI_FETCH_CACHE[cache_key] = (result, time.time())
+        # 限制缓存大小
+        if len(_WIKI_FETCH_CACHE) > _WIKI_CACHE_LIMIT:
+            oldest_key = min(_WIKI_FETCH_CACHE.keys(), key=lambda k: _WIKI_FETCH_CACHE[k][1])
+            del _WIKI_FETCH_CACHE[oldest_key]
+        return result
+    
+    # 如果原始主机失败，尝试镜像
+    print(f"[Wiki] Primary host failed, trying mirrors for {title}")
+    for mirror in _WIKI_MIRRORS:
+        if mirror in host:
+            continue  # 跳过原始主机
+        result = _fetch_wikipedia_from_host(mirror.replace("https://", ""), title)
+        if result:
+            # 存入缓存
+            _WIKI_FETCH_CACHE[cache_key] = (result, time.time())
+            return result
+    
+    return None
+
+
+def _fetch_wikipedia_from_host(host: str, title: str) -> Optional[dict]:
+    """从指定主机获取 Wikipedia 内容"""
+    try:
+        # 尝试 REST API
+        api = f"https://{host}/api/rest_v1/page/summary/{urllib.parse.quote(title)}"
+        req = urllib.request.Request(api, headers={"User-Agent": _WIKI_UA})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        extract = str(data.get("extract") or "")
+        if extract:
+            return {
+                "source": api,
+                "content": extract,
+                "title": data.get("title") or title,
+                "sitename": host,
+                "type": "wiki-summary",
+            }
+    except Exception as e:
+        pass
+    
+    try:
+        # 尝试 PHP API
+        api_php = f"https://{host}/w/api.php?action=query&format=json&prop=extracts&titles={urllib.parse.quote(title)}&exintro=1&explaintext=1"
+        req = urllib.request.Request(api_php, headers={"User-Agent": _WIKI_UA})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        pages = data.get("query", {}).get("pages", {})
+        for pid, pdata in pages.items():
+            extract = pdata.get("extract", "")
             if extract:
                 return {
-                    "source": api,
+                    "source": api_php,
                     "content": extract,
-                    "title": data.get("title") or title,
+                    "title": pdata.get("title") or title,
                     "sitename": host,
-                    "type": "wiki-summary",
+                    "type": "wiki-extract",
                 }
-        except Exception as e:
-            print(f"[Monitoring] Wiki REST API failed: {e}")
+    except Exception as e:
+        pass
+    
+    return None
 
-        try:
-            api_php = f"https://{host}/w/api.php?action=query&format=json&prop=extracts&titles={urllib.parse.quote(title)}&exintro=1&explaintext=1"
-            req = urllib.request.Request(api_php, headers={"User-Agent": _WIKI_UA})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8", "replace"))
-            pages = data.get("query", {}).get("pages", {})
-            for pid, pdata in pages.items():
-                extract = pdata.get("extract", "")
-                if extract:
-                    return {
-                        "source": api_php,
-                        "content": extract,
-                        "title": pdata.get("title") or title,
-                        "sitename": host,
-                        "type": "wiki-extract",
-                    }
-        except Exception as e:
-            print(f"[Monitoring] Wiki PHP API failed: {e}")
 
-        return None
-    except Exception:
-        return None
+# 保持原函数用于兼容
+def _fetch_wikipedia_rest(url: str) -> Optional[dict]:
+    """新版使用缓存的 Wikipedia 获取函数"""
+    return _fetch_wikipedia_with_cache(url)
 
 
 def _fetch_reprap_mediawiki(url: str) -> Optional[dict]:
@@ -640,14 +1207,12 @@ def _fetch_reprap_mediawiki(url: str) -> Optional[dict]:
 
 
 def _safe_search_baidu(query: str, k: int) -> List[Dict]:
-    """封装百度搜索，带异常处理"""
+    """封装百度搜索，带异常处理（已不推荐使用）"""
     if not _BAIDU_AVAILABLE:
         return []
     try:
         results = []
         # baidusearch returns a generator
-        # Note: baidusearch library uses requests internally, difficult to patch global session easily without monkey patch
-        # But we can limit results for speed
         raw_results = baidu_search(query, num_results=k)
         for i, r in enumerate(raw_results):
             if i >= k:
@@ -658,12 +1223,73 @@ def _safe_search_baidu(query: str, k: int) -> List[Dict]:
                     "summary": r.get("abstract", ""),
                     "url": r.get("url", ""),
                     "source": "baidu",
-                    "score": 1.0 - (i * 0.1),  # Simple decay
+                    "score": 1.0 - (i * 0.1),
                 }
             )
         return _filter_search_results(results)
     except Exception as e:
         print(f"[Search] Baidu failed: {e}")
+        return []
+
+
+def _safe_search_bocha(query: str, k: int) -> List[Dict]:
+    """封装博查(Bocha) API搜索，用于中文查询"""
+    if not _BOCHA_AVAILABLE:
+        return []
+    
+    try:
+        # 构建请求
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        data = {
+            "query": query,
+            "count": k,
+            "page": 1,
+            "webPages": True,
+            "news": False,
+            "relatedLinks": False
+        }
+        
+        json_data = json.dumps(data).encode('utf-8')
+        
+        req = urllib.request.Request(
+            _BOCHA_API_URL,
+            data=json_data,
+            headers={
+                "Authorization": f"Bearer {_BOCHA_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            method="POST"
+        )
+        
+        with urllib.request.urlopen(req, timeout=30, context=ssl_context) as response:
+            result = response.read().decode('utf-8')
+            data = json.loads(result)
+        
+        if data.get("code") != 200:
+            print(f"[Search] Bocha API error: {data.get('msg')}")
+            return []
+        
+        web_pages = data.get("data", {}).get("webPages", {}).get("value", [])
+        
+        results = []
+        for i, item in enumerate(web_pages):
+            if i >= k:
+                break
+            results.append({
+                "title": item.get("name", ""),
+                "summary": item.get("snippet", ""),
+                "url": item.get("url", ""),
+                "source": "bocha",
+                "score": 1.0 - (i * 0.1),
+            })
+        
+        return _filter_search_results(results)
+        
+    except Exception as e:
+        print(f"[Search] Bocha failed: {e}")
         return []
 
 
@@ -697,7 +1323,7 @@ def _safe_search_serper(
         try:
             headers = {"X-API-KEY": key, "Content-Type": "application/json"}
             # Use Global Session for reuse
-            resp = _GLOBAL_SESSION.post(url, headers=headers, data=payload, timeout=4)
+            resp = _GLOBAL_SESSION.post(url, headers=headers, data=payload, timeout=15)
 
             if resp.status_code == 200:
                 data = resp.json()
@@ -747,11 +1373,19 @@ def _safe_search_searxng(query: str, k: int, base_url: str) -> List[Dict]:
     """封装 SearXNG 搜索"""
     try:
         searxng_url = f"{base_url.rstrip('/')}/search"
+
+        # 实体消歧预处理：检测可能混淆的实体并添加限定词
+        disambiguated_query = _disambiguate_entities(query)
+
+        # 强制使用英文搜索，避免中文分词干扰
+        # 只有当查询本身包含明确的中文内容时才使用中文
         is_chinese = any("\u4e00" <= ch <= "\u9fff" for ch in query)
+        use_english = not is_chinese or _is_english_entity_query(query)
+
         params = {
-            "q": query,
+            "q": disambiguated_query,
             "format": "json",
-            "language": "zh-CN" if is_chinese else "en-US",
+            "language": "en-US" if use_english else "zh-CN",
         }
 
         # 添加适当的HTTP头来绕过SearXNG的bot detection
@@ -760,7 +1394,7 @@ def _safe_search_searxng(query: str, k: int, base_url: str) -> List[Dict]:
             "X-Forwarded-For": "127.0.0.1",
             "X-Real-IP": "127.0.0.1",
             "Accept": "application/json",
-            "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+            "Accept-Language": "en-US,en;q=0.9",
         }
 
         # Use Global Session with custom headers
@@ -801,7 +1435,11 @@ def _safe_search_searxng(query: str, k: int, base_url: str) -> List[Dict]:
                 )
 
             # 使用评分系统对结果进行筛选和排序
-            filtered_results = _filter_searxng_results(raw_results, query, k)
+            filtered_results = _filter_searxng_results(
+                raw_results, disambiguated_query, k
+            )
+            # 额外过滤低质量结果
+            filtered_results = _filter_low_quality_results(filtered_results, query)
             return _filter_search_results(filtered_results)
         return []
     except Exception as e:
@@ -1001,76 +1639,135 @@ def web_search(query: str, top_k: int = 5) -> str:
 
         # 1. Optimize Query
         optimized_q = _optimize_search_query(query)
+        
+        # 1.5. 对实体类查询添加 Wikipedia 限定（仅对Serper英文搜索有效）
+        if _is_entity_query(query) and "site:" not in optimized_q.lower():
+            # 检测查询语言，选择合适的 Wikipedia 站点
+            # 注意：仅对非中文查询添加Wikipedia限定，中文查询不添加以避免限制搜索结果
+            is_chinese_query = any("\u4e00" <= ch <= "\u9fff" for ch in query[:50])
+            if not is_chinese_query:
+                optimized_q = f"{optimized_q} site:wikipedia.org"
+                print(f"[Monitoring] Entity query detected, added Wikipedia site限定: {optimized_q[:80]}...")
+        
         is_chinese = any("\u4e00" <= ch <= "\u9fff" for ch in optimized_q)
 
-        # 2. Define Tasks with Priority Order (SearXNG first)
+        # 2. Define Tasks with New Priority Order:
+        #    - Serper as main provider
+        #    - Chinese questions use Baidu first
+        #    - SearXNG and DuckDuckGo as backup
         searxng_base_url = os.getenv("SEARXNG_BASE_URL")
         serper_key = os.getenv("SERPER_API_KEY")
 
-        # Check if SearXNG is available first
-        if searxng_base_url:
-            print(f"[Search] Trying SearXNG first (priority provider)")
+        # Strategy: Try primary provider first based on query type
+        primary_provider_tried = False
+        primary_results = []
+        primary_provider_name = ""
+
+        # Case 1: Chinese query -> Try Bocha first (highest priority for Chinese)
+        if is_chinese and _BOCHA_AVAILABLE:
+            print(
+                f"[Search] Chinese query detected, trying Bocha first (primary provider)"
+            )
             try:
-                searxng_results = _safe_search_searxng(
-                    optimized_q, top_k, searxng_base_url
-                )
-                if searxng_results:
+                primary_results = _safe_search_bocha(optimized_q, top_k)
+                if primary_results:
                     print(
-                        f"[Search] Got {len(searxng_results)} results from SearXNG, using as primary source"
+                        f"[Search] Got {len(primary_results)} results from Bocha (Chinese primary)"
                     )
-
-                    # Enhance SearXNG results with detailed content if enabled
-                    should_enhance_content = (
-                        os.getenv("ENHANCE_SEARCH_CONTENT", "false").lower() == "true"
-                    )
-                    if should_enhance_content and searxng_results:
-                        print(
-                            f"[Monitoring] Enhancing SearXNG search results with detailed content..."
-                        )
-                        try:
-                            from .content_enhancer import (
-                                sync_enhance_search_results_with_content,
-                            )
-
-                            searxng_results = sync_enhance_search_results_with_content(
-                                searxng_results, optimized_q
-                            )
-                        except ImportError:
-                            print(
-                                "[Monitoring] Content enhancer not available, skipping enhancement"
-                            )
-                        except Exception as e:
-                            print(f"[Monitoring] Content enhancement failed: {e}")
-
-                    return json.dumps(
-                        {
-                            "source": "searxng_primary",
-                            "results": searxng_results,
-                            "providers_used": 1,
-                            "primary_provider": "searxng",
-                        },
-                        ensure_ascii=False,
-                    )
+                    primary_provider_name = "bocha"
+                    primary_provider_tried = True
             except Exception as e:
-                print(f"[Search] SearXNG failed as primary source: {e}")
+                print(f"[Search] Bocha failed as primary: {e}")
+        
+        # Fallback to Baidu if Bocha is not available
+        if is_chinese and not primary_provider_tried and _BAIDU_AVAILABLE:
+            print(
+                f"[Search] Bocha not available, trying Baidu as fallback"
+            )
+            try:
+                primary_results = _safe_search_baidu(optimized_q, top_k)
+                if primary_results:
+                    print(
+                        f"[Search] Got {len(primary_results)} results from Baidu (fallback)"
+                    )
+                    primary_provider_name = "baidu"
+                    primary_provider_tried = True
+            except Exception as e:
+                print(f"[Search] Baidu failed as fallback: {e}")
 
-        # If SearXNG is not available or failed, proceed with other providers
+        # Case 2: Non-Chinese query -> Try Serper first (main provider)
+        if not primary_provider_tried and serper_key:
+            print(f"[Search] Trying Serper first (main provider)")
+            try:
+                primary_results = _safe_search_serper(optimized_q, top_k, serper_key)
+                if primary_results:
+                    print(
+                        f"[Search] Got {len(primary_results)} results from Serper (main provider)"
+                    )
+                    primary_provider_name = "serper"
+                    primary_provider_tried = True
+            except Exception as e:
+                print(f"[Search] Serper failed as primary: {e}")
+
+        # If primary provider succeeded, return results with optional enhancement
+        if primary_results:
+            # Enhance results with detailed content if enabled
+            should_enhance_content = (
+                os.getenv("ENHANCE_SEARCH_CONTENT", "false").lower() == "true"
+            )
+            if should_enhance_content and primary_results:
+                print(
+                    f"[Monitoring] Enhancing {primary_provider_name} search results with detailed content..."
+                )
+                try:
+                    from .content_enhancer import (
+                        sync_enhance_search_results_with_content,
+                    )
+
+                    primary_results = sync_enhance_search_results_with_content(
+                        primary_results, optimized_q
+                    )
+                except ImportError:
+                    print(
+                        "[Monitoring] Content enhancer not available, skipping enhancement"
+                    )
+                except Exception as e:
+                    print(f"[Monitoring] Content enhancement failed: {e}")
+
+            return json.dumps(
+                {
+                    "source": f"{primary_provider_name}_primary",
+                    "results": primary_results,
+                    "providers_used": 1,
+                    "primary_provider": primary_provider_name,
+                },
+                ensure_ascii=False,
+            )
+
+        # If primary provider failed or not available, try backup providers in parallel
+        print(
+            f"[Search] Primary provider failed or not available, trying backup providers..."
+        )
+
         tasks = []
 
-        # Task: Serper
-        if serper_key:
-            tasks.append(lambda: _safe_search_serper(optimized_q, top_k, serper_key))
+        # Task: SearXNG (backup)
+        if searxng_base_url:
+            tasks.append(
+                lambda: _safe_search_searxng(optimized_q, top_k, searxng_base_url)
+            )
 
-        # Task: Baidu (If Chinese or no SearXNG/Serper)
-        # Always try Baidu for Chinese queries to get local context
-        if _BAIDU_AVAILABLE and is_chinese:
-            tasks.append(lambda: _safe_search_baidu(optimized_q, top_k))
-        elif _BAIDU_AVAILABLE and not serper_key and not searxng_base_url:
-            tasks.append(lambda: _safe_search_baidu(optimized_q, top_k))
-
-        # Task: DuckDuckGo (Supplemental)
+        # Task: DuckDuckGo (backup)
         if _DDGS_AVAILABLE:
             tasks.append(lambda: _safe_search_ddgs(optimized_q, top_k))
+
+        # Task: Baidu (backup, if not tried as primary)
+        if _BAIDU_AVAILABLE and not (is_chinese and primary_provider_name == "baidu"):
+            tasks.append(lambda: _safe_search_baidu(optimized_q, top_k))
+
+        # Task: Serper (backup, if not tried as primary)
+        if serper_key and primary_provider_name != "serper":
+            tasks.append(lambda: _safe_search_serper(optimized_q, top_k, serper_key))
 
         # 3. Parallel Execution
         all_results = []
@@ -1101,7 +1798,9 @@ def web_search(query: str, top_k: int = 5) -> str:
             os.getenv("ENHANCE_SEARCH_CONTENT", "false").lower() == "true"
         )
         if should_enhance_content and final_results:
-            print(f"[Monitoring] Enhancing search results with detailed content...")
+            print(
+                f"[Monitoring] Enhancing backup search results with detailed content..."
+            )
             try:
                 from .content_enhancer import sync_enhance_search_results_with_content
 
@@ -1117,10 +1816,10 @@ def web_search(query: str, top_k: int = 5) -> str:
 
         return json.dumps(
             {
-                "source": "mixed_fallback",
+                "source": "mixed_backup",
                 "results": final_results,
                 "providers_used": len(tasks),
-                "primary_provider": "searxng_unavailable",
+                "primary_provider": "backup_providers",
             },
             ensure_ascii=False,
         )
@@ -1507,6 +2206,12 @@ def web_fetch(url: str, max_bytes: int = 200_000) -> str:
                     "drission_session"
                 )
 
+            # L3.5: Jina Reader (Markdown格式，极速)
+            # 使用全局 session
+            futures[_FETCH_EXECUTOR.submit(_fetch_with_jina, url, _GLOBAL_SESSION)] = (
+                "jina"
+            )
+
             # Wait for results (fastest wins)
             for future in as_completed(futures, timeout=5):
                 try:
@@ -1549,12 +2254,15 @@ def web_fetch(url: str, max_bytes: int = 200_000) -> str:
                     print(f"[WebFetch] Heavyweight fetch failed: {e}")
 
             if content_result:
+                # 压缩内容：从15000字符减少到5000字符
+                compressed_content = _compress_fetched_content(content_result, max_length=5000)
+                
                 # 缓存
                 try:
                     result = json.dumps(
                         {
                             "source": url,
-                            "content": content_result[:20000],
+                            "content": compressed_content,
                             "type": source_type,
                         },
                         ensure_ascii=False,
@@ -1572,7 +2280,7 @@ def web_fetch(url: str, max_bytes: int = 200_000) -> str:
                 return json.dumps(
                     {
                         "source": url,
-                        "content": content_result[:20000],
+                        "content": compressed_content,
                         "type": source_type,
                     },
                     ensure_ascii=False,

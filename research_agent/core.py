@@ -221,6 +221,7 @@ MULTI_HOP_SYSTEM_PROMPT = """<instruction>
 <mode name="假设堆叠">在未验证的假设上构建链条。</mode>
 <mode name="忽略精确数字">接受 "足够接近" 或模糊的匹配。</mode>
 <mode name="无回溯">坚持死胡同路径而不是转向。</mode>
+<mode name="负向约束忽视">对于"不"、"无"、"没有"、"不参与"等负向约束，必须主动搜索反例证据，不能仅凭假设认为满足。</mode>
 </failure_modes_to_avoid>
 
 <success_checklist>
@@ -241,6 +242,14 @@ MULTI_HOP_SYSTEM_PROMPT = """<instruction>
 <final_instruction>
 只有当所有方框都勾选 -> 输出最终答案。
 记住: 回溯 5 次找到正确答案比匆忙给出错误答案要好。
+
+⚠️ 关键警告:
+1. 不要过早给出答案! 即使你"觉得"知道答案，也必须通过搜索验证每一个约束条件
+2. 对于负向约束("不"、"无"、"没有"、"不参与")，必须主动搜索反例证据，证明确实"没有"该关系
+3. 如果搜索结果一直不理想，必须继续尝试不同关键词，而不是放弃验证
+4. 答案必须经过至少2个独立来源的交叉验证
+5. 在达到30步之前，不要输出最终答案
+
 现在按照上述所有协议进行系统的调查。
 </final_instruction>
 </instruction>"""
@@ -254,6 +263,7 @@ class AgentState(TypedDict):
     pending_tool_calls: List[dict]
     emitted: List[Chunk]
     meta: dict
+    force_continue: bool  # Force agent to continue when early Final Answer detected
 
 
 def _sanitize_messages(messages: list) -> list:
@@ -501,8 +511,8 @@ Alternative approach: [What I'll try instead]
                     messages=prompt_messages,
                     tools=tool_schema,
                     stream=True,
-                    temperature=0.4,
-                    max_tokens=1024,
+                    temperature=0.2,
+                    max_tokens=5000,
                 )
 
             stream = await asyncio.to_thread(run_llm_sync)
@@ -557,17 +567,29 @@ Alternative approach: [What I'll try instead]
             print(f"[Agent] LLM Error: {e}")
             return {"emitted": []}  # Should probably retry or fail gracefully
 
-        # Process Tool Calls
+        # Process Tool Calls with JSON validation
         pending_tool_calls = []
         for idx in sorted(tool_calls_buffer.keys()):
             raw = tool_calls_buffer[idx]
+
+            # Validate function.arguments is valid JSON
+            func_args = raw["function"]["arguments"]
+            if func_args:
+                try:
+                    json.loads(func_args)
+                except json.JSONDecodeError as e:
+                    print(f"[Warning] Invalid JSON in tool_call arguments: {e}")
+                    print(f"[Warning] Raw arguments: {func_args[:200]}...")
+                    # Skip this invalid tool call
+                    continue
+
             pending_tool_calls.append(
                 {
                     "id": raw["id"],
                     "type": "function",
                     "function": {
                         "name": raw["function"]["name"],
-                        "arguments": raw["function"]["arguments"],
+                        "arguments": func_args,
                     },
                 }
             )
@@ -582,9 +604,47 @@ Alternative approach: [What I'll try instead]
                 msg["tool_calls"] = pending_tool_calls
             new_messages.append(msg)
 
+        MIN_STEPS_BEFORE_FINAL = 20
+
         # Check for verification table before Final Answer
+        print(
+            f"[DEBUG] Checking Final Answer at step {current_step}, content length: {len(content_buffer)}"
+        )
+
+        # Track if we need to force continue (early Final Answer detected)
+        force_continue = False
+
         if "Final Answer:" in content_buffer or "最终答案:" in content_buffer:
-            if "CONSTRAINT VERIFICATION TABLE" not in content_buffer:
+            print(f"[DEBUG] Final Answer DETECTED at step {current_step}")
+            # Enforce minimum steps before final answer
+            if current_step < MIN_STEPS_BEFORE_FINAL:
+                print(
+                    f"[WARNING] Attempting to answer at step {current_step}, but minimum {MIN_STEPS_BEFORE_FINAL} steps required!"
+                )
+                error_msg = f"""
+⚠️ CRITICAL ERROR: You are attempting to output Final Answer at step {current_step}, but you must complete at least {MIN_STEPS_BEFORE_FINAL} steps.
+
+You MUST:
+1. Continue searching and verifying information
+2. Ensure you have gathered sufficient evidence
+3. Only output Final Answer after step {MIN_STEPS_BEFORE_FINAL}
+
+Continue your research now. DO NOT output Final Answer yet.
+"""
+                # Remove the Final Answer from content to prevent it from being returned
+                # Split by "Final Answer:" and keep only the reasoning part
+                if "Final Answer:" in content_buffer:
+                    content_buffer = content_buffer.split("Final Answer:")[0]
+                elif "最终答案:" in content_buffer:
+                    content_buffer = content_buffer.split("最终答案:")[0]
+
+                # Update the message content (remove Final Answer part)
+                if new_messages and new_messages[-1].get("role") == "assistant":
+                    new_messages[-1]["content"] = content_buffer
+
+                new_messages.append({"role": "system", "content": error_msg})
+                force_continue = True
+            elif "CONSTRAINT VERIFICATION TABLE" not in content_buffer:
                 print("[WARNING] Final answer without verification table!")
 
                 # Force requirement to supplement verification table
@@ -649,6 +709,7 @@ Alternative approach: [What I'll try instead]
             "pending_tool_calls": pending_tool_calls,
             "emitted": emitted,
             "step_index": current_step,  # Step index increments in executor or after tool
+            "force_continue": force_continue,  # Force continue when early Final Answer blocked
         }
 
     async def tools_node(state: AgentState) -> dict:
@@ -663,8 +724,31 @@ Alternative approach: [What I'll try instead]
         return result
 
     def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
-        if state.get("pending_tool_calls"):
+        # Debug logging
+        force_continue_val = state.get("force_continue")
+        pending_calls = state.get("pending_tool_calls")
+        current_step = state.get("step_index", 0)
+        MIN_STEPS_BEFORE_FINAL = 20
+
+        print(
+            f"[DEBUG] should_continue called: force_continue={force_continue_val}, pending_tool_calls={len(pending_calls) if pending_calls else 0}, step={current_step}"
+        )
+
+        # If force_continue is True, agent must continue searching
+        # This happens when early Final Answer was blocked
+        if force_continue_val:
+            print("[DEBUG] force_continue=True, forcing agent to continue")
             return "tools"
+        if pending_calls:
+            return "tools"
+
+        # BUG FIX: If we haven't reached minimum steps, continue even with empty content
+        if current_step < MIN_STEPS_BEFORE_FINAL:
+            print(
+                f"[DEBUG] Step {current_step} < {MIN_STEPS_BEFORE_FINAL}, forcing continue to reach minimum steps"
+            )
+            return "tools"
+
         return "__end__"
 
     # --- Graph Construction ---
@@ -693,6 +777,7 @@ Alternative approach: [What I'll try instead]
         "pending_tool_calls": [],
         "emitted": [],
         "meta": {"searched_keywords": []},
+        "force_continue": False,  # Initially False, set True when early Final Answer blocked
     }
 
     # We use stream_mode="updates" to get state updates from each node

@@ -18,6 +18,10 @@ def execute_tools_logic(state: dict, tool_functions_map: dict, memory) -> dict:
     meta = state.get("meta") or {"searched_keywords": [], "seen_entities": [], "last_skill_output": None, "dynamic_retrieval_count": 0}
     searched_before = set(meta.get("searched_keywords") or [])
 
+    # Handle force_continue case: when early Final Answer was blocked
+    # but no tool calls were made, we still need to increment step and reset flag
+    force_continue = state.get("force_continue", False)
+    
     new_memory_items = []
     for tool_data in state.get("pending_tool_calls") or []:
         call_id = tool_data["id"]
@@ -107,4 +111,5 @@ def execute_tools_logic(state: dict, tool_functions_map: dict, memory) -> dict:
         "pending_tool_calls": [],
         "step_index": state["step_index"] + 1,
         "meta": meta,
+        "force_continue": False,  # Reset flag after processing
     }
