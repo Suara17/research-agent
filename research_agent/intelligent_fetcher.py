@@ -71,12 +71,12 @@ class DomainStatus:
             'www.wikidata.org', 'api.wikipedia.org',
         }
         if domain in fast_domains:
-            return 5
+            return 3
 
-        # 首次尝试：5秒快速失败
-        # 后续尝试：逐渐增加，最多10秒
-        base_timeout = 5
-        return min(base_timeout + attempt * 3, 10)
+        # 首次尝试：3秒快速失败
+        # 后续尝试：逐渐增加，最多8秒
+        base_timeout = 3
+        return min(base_timeout + attempt * 2, 8)
 
 
 class ErrorClassifier:

@@ -215,7 +215,15 @@ class MemoryStore:
                 enriched.append({"text": r["text"], "score": r["score"], "age_days": 0})
         return enriched
 
-    def search(self, query: str, top_k: int = 3, time_boost: bool = True) -> List[dict]:
+    def search(self, query: str, top_k: int = 3, time_boost: bool = True, min_score: float = 0.3) -> List[dict]:
+        """搜索记忆，支持相关性过滤
+        
+        Args:
+            query: 查询文本
+            top_k: 返回结果数量
+            time_boost: 是否启用时间衰减boost
+            min_score: 最小相关性分数阈值，低于此分数的结果将被过滤掉
+        """
         k1 = 1.5
         b = 0.75
         if any("\u4e00" <= ch <= "\u9fff" for ch in str(query)):
@@ -284,4 +292,7 @@ class MemoryStore:
                     scores[doc_id] *= time_factor
 
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:max(1, int(top_k))]
-        return [{"text": self.doc_texts[d], "score": float(sc)} for d, sc in ranked]
+        
+        # 过滤低相关性结果
+        filtered_results = [{"text": self.doc_texts[d], "score": float(sc)} for d, sc in ranked if sc >= min_score]
+        return filtered_results

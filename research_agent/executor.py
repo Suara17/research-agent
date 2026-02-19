@@ -3,13 +3,79 @@ import time
 import re
 import urllib.parse
 from difflib import SequenceMatcher
-from typing import List, Callable, Optional, cast
+from typing import List, Callable, Optional, cast, Dict
 
 from openai.types.chat import ChatCompletionChunk
 
 from .utils import get_llm_client
 from .schema import ToolCall, Chunk
 from .search import extract_answer_from_search_results
+
+
+# 用于跟踪搜索循环的计数器
+_SEARCH_LOOP_COUNTER: Dict[str, int] = {}
+_MAX_LOOP_COUNT = 3  # 同一查询重复3次后触发换词
+
+
+def _detect_and_rewrite_query(query: str, search_history: List[str]) -> str:
+    """
+    检测搜索循环并尝试重写查询
+    
+    Args:
+        query: 原始查询
+        search_history: 历史搜索记录
+        
+    Returns:
+        改进后的查询（如果检测到循环），否则返回原查询
+    """
+    # 归一化查询（去除空格，转小写）
+    normalized_q = query.lower().strip()
+    
+    # 检查是否在短时间内重复相同查询
+    recent_same = [q for q in search_history[-5:] if q.lower().strip() == normalized_q]
+    
+    if len(recent_same) >= _MAX_LOOP_COUNT:
+        print(f"[LoopDetection] Detected repeated query: '{query}' ({len(recent_same)} times)")
+        
+        # 尝试生成替代查询
+        try:
+            client = get_llm_client()
+            # 使用LLM生成替代搜索词
+            rewrite_prompt = f"""<instruction>
+<task>生成一个不同的搜索查询来解决当前问题。</task>
+<original_query>{query}</original_query>
+<search_history>
+{chr(10).join(search_history[-10:])}
+</search_history>
+<constraint>
+1. 生成一个语义相似但措辞不同的查询
+2. 尝试使用不同的关键词、同义词或更具体的描述
+3. 如果原查询是英文，尝试不同的英文表达
+4. 如果原查询是中文，可以尝试混合英文或使用不同的中文表达
+</constraint>
+</instruction>"""
+
+            resp = client.chat.completions.create(
+                model="qwen3-max",
+                messages=[{"role": "user", "content": rewrite_prompt}],
+                max_tokens=128,
+                temperature=0.7
+            )
+            
+            new_query = resp.choices[0].message.content.strip().strip('"').strip("'")
+            
+            if new_query and new_query != query:
+                print(f"[LoopDetection] Rewriting query: '{query}' -> '{new_query}'")
+                return new_query
+        except Exception as e:
+            print(f"[LoopDetection] Query rewrite failed: {e}")
+    
+    return query
+
+
+def _normalize_for_loop_detection(query: str) -> str:
+    """归一化查询用于循环检测（忽略大小写和多余空格）"""
+    return " ".join(query.lower().split())
 
 def execute_tools_logic(state: dict, tool_functions_map: dict, memory) -> dict:
     client = get_llm_client(timeout=30.0)
@@ -37,9 +103,27 @@ def execute_tools_logic(state: dict, tool_functions_map: dict, memory) -> dict:
             
             if func_name == "web_search":
                 q0 = str(parsed_args.get("query") or "")
+                
+                # === 搜索循环检测与重写 ===
+                # 获取搜索历史
+                search_history = meta.get("searched_keywords", [])
+                
+                # 检测并可能重写查询
+                rewritten_query = _detect_and_rewrite_query(q0, search_history)
+                
+                if rewritten_query != q0:
+                    # 查询被重写，更新参数
+                    parsed_args["query"] = rewritten_query
+                    q0 = rewritten_query
+                    # 更新tool_call的arguments
+                    func_args_str = json.dumps(parsed_args)
+                    tool_call.tool_arguments = parsed_args
+                    print(f"[Executor] Using rewritten query: '{rewritten_query}'")
+                
+                # 原有相似度检测（保留作为额外检查）
                 sim_high = False
                 for old_q in searched_before:
-                    if SequenceMatcher(None, q0, old_q).ratio() > 0.95: # Increased threshold to be less aggressive
+                    if SequenceMatcher(None, q0, old_q).ratio() > 0.95:
                         sim_high = True
                         break
                 if sim_high:

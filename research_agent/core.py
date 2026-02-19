@@ -248,7 +248,6 @@ MULTI_HOP_SYSTEM_PROMPT = """<instruction>
 2. 对于负向约束("不"、"无"、"没有"、"不参与")，必须主动搜索反例证据，证明确实"没有"该关系
 3. 如果搜索结果一直不理想，必须继续尝试不同关键词，而不是放弃验证
 4. 答案必须经过至少2个独立来源的交叉验证
-5. 在达到30步之前，不要输出最终答案
 
 现在按照上述所有协议进行系统的调查。
 </final_instruction>
@@ -264,11 +263,52 @@ class AgentState(TypedDict):
     emitted: List[Chunk]
     meta: dict
     force_continue: bool  # Force agent to continue when early Final Answer detected
+    start_time: float  # Start time for timeout check
 
 
 def _sanitize_messages(messages: list) -> list:
     # Simple sanitization if needed
     return messages
+
+
+def _should_inject_memory(query: str, step: int, max_steps: int) -> bool:
+    """差异化记忆注入策略
+
+    根据问题复杂度和当前推理阶段决定是否注入记忆
+
+    Args:
+        query: 用户问题
+        step: 当前推理步数
+        max_steps: 最大步数
+
+    Returns:
+        bool: 是否应该注入记忆
+    """
+    import re
+
+    # 首轮不注入（还没进行任何搜索）
+    if step == 0:
+        return False
+
+    # 简单问题判断：长度短且无复杂模式
+    # 复杂问题特征：包含数字、多跳推理关键词、比较关系等
+    is_simple = (
+        len(query) < 30
+        and not re.search(r"\d+", query)  # 无数字
+        and not re.search(r"比|第一|最|哪个|多少|几年", query)  # 无推理关键词
+    )
+
+    if is_simple:
+        # 简单问题不注入，避免记忆干扰
+        return False
+
+    # 搜索遇到困难时（第5步之后）注入，帮助回忆之前的信息
+    if step > 5:
+        return True
+
+    # 中等复杂度问题，根据步数动态注入
+    # 后续步数可以注入，帮助Agent回忆之前尝试
+    return step > 0
 
 
 async def agent_loop(
@@ -342,6 +382,8 @@ async def agent_loop(
     async def agent_node(state: AgentState) -> dict:
         current_step = state["step_index"]
         limit = state.get("max_steps", max_steps)
+        start_time = state.get("start_time", time.time())
+        TIMEOUT_SECONDS = 600  # 10 minutes
 
         if current_step >= limit:
             return {"pending_tool_calls": [], "emitted": []}  # Stop
@@ -353,13 +395,70 @@ async def agent_loop(
         # We construct a temporary message list for LLM call
         prompt_messages = messages[:]
 
+        # Timeout Check - if approaching timeout, force urgency mode
+        elapsed = time.time() - start_time
+        timeout_urgency_msg = ""
+        if elapsed >= TIMEOUT_SECONDS - 10:  # Last 1 minute before timeout
+            remaining = int(TIMEOUT_SECONDS - elapsed)
+            timeout_urgency_msg = (
+                f"\n\n<timeout_urgency>\n"
+                f"  <warning>⏰ 超时警告: 剩余 {remaining} 秒!</warning>\n"
+                "  <instructions>\n"
+                "    <instruction>你必须立即停止搜索。</instruction>\n"
+                "    <instruction>基于现有信息提供最佳答案。</instruction>\n"
+                "    <instruction>格式: Final Answer: [Your Best Answer]</instruction>\n"
+                "  </instructions>\n"
+                "</timeout_urgency>"
+            )
+            prompt_messages.append({"role": "system", "content": timeout_urgency_msg})
+            print(
+                f"[DEBUG] Timeout urgency at step {current_step}, elapsed={elapsed:.1f}s"
+            )
+
         # Urgency & Drift Detection
         urgency_msg = ""
         try:
-            # Urgency Check (Last 20% or 5 steps)
-            threshold = max(limit - 5, int(limit * 0.8))
-            if current_step >= threshold:
+            # Use limit from state (consistent with should_continue)
+            FINAL_WARNING_START = limit - 3  # Start warning 3 steps before limit
+
+            # Critical: Last 3 steps - MUST output answer
+            if current_step >= FINAL_WARNING_START:
                 steps_left = limit - current_step
+                if steps_left <= 1:
+                    # Last step before hard limit - MUST output now
+                    print(
+                        f"[URGENCY] Step {current_step}: FINAL STEP! Must output answer now (steps_left={steps_left})"
+                    )
+                    urgency_msg = (
+                        f"\n\n<final_step_warning>\n"
+                        f"  <critical>🚨 这是最后一步！步数即将达到上限 {limit}。</critical>\n"
+                        "  <command>你必须立即输出最终答案！</command>\n"
+                        "  <format>Final Answer: [你的最佳答案]</format>\n"
+                        "  <note>不要再搜索，直接基于已有信息输出答案。</note>\n"
+                        "</final_step_warning>"
+                    )
+                else:
+                    # Final 3 steps warning
+                    print(
+                        f"[URGENCY] Step {current_step}: Final 3 steps warning (steps_left={steps_left})"
+                    )
+                    urgency_msg = (
+                        f"\n\n<step_limit_warning>\n"
+                        f"  <warning>⚠️ 你还剩下 {steps_left} 步即将达到上限 {limit}。</warning>\n"
+                        "  <instructions>\n"
+                        "    <instruction>停止搜索新信息。</instruction>\n"
+                        "    <instruction>综合现有信息准备答案。</instruction>\n"
+                        f"    <instruction>在 {steps_left} 步内必须输出: Final Answer: [你的答案]</instruction>\n"
+                        "  </instructions>\n"
+                        "</step_limit_warning>"
+                    )
+                prompt_messages.append({"role": "system", "content": urgency_msg})
+            elif current_step >= limit - 5:
+                # Normal urgency (5 steps before limit)
+                steps_left = limit - current_step
+                print(
+                    f"[URGENCY] Step {current_step}: Urgency mode (steps_left={steps_left})"
+                )
                 urgency_msg = (
                     f"\n\n<urgency_mode>\n"
                     f"  <warning>你还剩下 {steps_left} 步。</warning>\n"
@@ -463,16 +562,25 @@ Alternative approach: [What I'll try instead]
         if plan:
             system_prompt_addition += f"\n\n<initial_plan>\n{plan}\n</initial_plan>"
 
-        # Inject Memory Context
-        mem_hits = memory.search(user_query, top_k=4)
-        if mem_hits:
-            joined = "\n".join([(hit.get("text") or "")[:500] for hit in mem_hits])
-            prompt_messages.insert(
-                1,
-                {
-                    "role": "system",
-                    "content": f"<memory_context>\n{joined}\n</memory_context>",
-                },
+        # 差异化记忆注入策略
+        # 判断是否需要注入记忆
+        should_inject = _should_inject_memory(user_query, current_step, limit)
+
+        if should_inject:
+            # 使用min_score=0.3过滤低相关性结果
+            mem_hits = memory.search(user_query, top_k=4, min_score=0.3)
+            if mem_hits:
+                joined = "\n".join([(hit.get("text") or "")[:500] for hit in mem_hits])
+                prompt_messages.insert(
+                    1,
+                    {
+                        "role": "system",
+                        "content": f"<memory_context>\n{joined}\n</memory_context>",
+                    },
+                )
+        else:
+            print(
+                f"[Memory] Skipping memory injection at step {current_step} (query: {user_query[:30]}...)"
             )
 
         # Update System Message
@@ -604,7 +712,8 @@ Alternative approach: [What I'll try instead]
                 msg["tool_calls"] = pending_tool_calls
             new_messages.append(msg)
 
-        MIN_STEPS_BEFORE_FINAL = 20
+        MIN_STEPS_BEFORE_FINAL = max(5, limit - 10)  # At least 5 steps before final
+        FINAL_CHANCE_START = limit - 3  # Last 3 steps allow best-effort answer
 
         # Check for verification table before Final Answer
         print(
@@ -613,6 +722,11 @@ Alternative approach: [What I'll try instead]
 
         # Track if we need to force continue (early Final Answer detected)
         force_continue = False
+
+        # Check if we're in the "final chance" window (last 3 steps)
+        in_final_chance_window = (
+            current_step >= FINAL_CHANCE_START and current_step < limit
+        )
 
         if "Final Answer:" in content_buffer or "最终答案:" in content_buffer:
             print(f"[DEBUG] Final Answer DETECTED at step {current_step}")
@@ -645,25 +759,50 @@ Continue your research now. DO NOT output Final Answer yet.
                 new_messages.append({"role": "system", "content": error_msg})
                 force_continue = True
             elif "CONSTRAINT VERIFICATION TABLE" not in content_buffer:
-                print("[WARNING] Final answer without verification table!")
+                # In final chance window (last 3 steps), allow best-effort answer
+                if in_final_chance_window:
+                    print(
+                        f"[WARNING] Final answer without verification table at step {current_step}. Allowing best-effort answer in final chance window."
+                    )
+                    # Allow the answer to proceed, but add a warning
+                    warning_msg = f"""
+⚠️ NOTE: You are outputting Final Answer at step {current_step} without a complete verification table.
+This is allowed because you are in the final chance window (steps {FINAL_CHANCE_START}-{limit - 1}).
 
-                # Force requirement to supplement verification table
-                error_msg = """
-512→⚠️ CRITICAL ERROR: You attempted to output Final Answer without a Constraint Verification Table.
-513→
-514→You MUST:
-515→1. List ALL constraints from the original query
-516→2. For EACH constraint, show:
-517→   - What you searched
-518→   - What you found
-519→   - ✓/✗/? status
-520→3. Only if ALL are ✓, then output final answer
-521→
-522→Please complete the verification table now.
-523→"""
-                new_messages.append({"role": "system", "content": error_msg})
+Your answer will be accepted as the best-effort result. Make sure your answer is well-reasoned.
+"""
+                    new_messages.append({"role": "system", "content": warning_msg})
+                    # In final chance window, don't force continue - allow the answer
+                else:
+                    print(
+                        "[WARNING] Final answer without verification table! Forcing continue..."
+                    )
+
+                    # Force requirement to supplement verification table
+                    error_msg = f"""
+⚠️ CRITICAL ERROR: You attempted to output Final Answer without a Constraint Verification Table.
+
+You MUST:
+1. List ALL constraints from the original query
+2. For EACH constraint, show:
+   - What you searched
+   - What you found
+   - ✓/✗/? status
+3. Only if ALL are ✓, then output final answer
+
+Please complete the verification table now. You MUST continue searching to verify your answer.
+If you reach step {MIN_STEPS_BEFORE_FINAL}, you will be allowed to output your best answer.
+"""
+                    new_messages.append({"role": "system", "content": error_msg})
+                    # Force continue when verification table is missing (not in final chance window)
+                    force_continue = True
 
             else:
+                # If verification table exists, reset force_continue to allow final answer
+                print(
+                    f"[DEBUG] Verification table found at step {current_step}, resetting force_continue to allow final answer"
+                )
+                force_continue = False
                 # Answer Cleaning & Verification
                 try:
                     from .answer_synthesis import verify_and_clean_answer
@@ -728,11 +867,31 @@ Continue your research now. DO NOT output Final Answer yet.
         force_continue_val = state.get("force_continue")
         pending_calls = state.get("pending_tool_calls")
         current_step = state.get("step_index", 0)
-        MIN_STEPS_BEFORE_FINAL = 20
+        start_time = state.get("start_time", time.time())
+        max_steps_val = state.get("max_steps", 30)  # Get from state, default 30
+        MIN_STEPS_BEFORE_FINAL = max(
+            5, max_steps_val - 10
+        )  # At least 5 steps before final
+        TIMEOUT_SECONDS = 600  # 10 minutes timeout
 
+        elapsed = time.time() - start_time
         print(
-            f"[DEBUG] should_continue called: force_continue={force_continue_val}, pending_tool_calls={len(pending_calls) if pending_calls else 0}, step={current_step}"
+            f"[DEBUG] should_continue called: force_continue={force_continue_val}, pending_tool_calls={len(pending_calls) if pending_calls else 0}, step={current_step}/{max_steps_val}, elapsed={elapsed:.1f}s"
         )
+
+        # Timeout check: if elapsed time exceeds TIMEOUT_SECONDS, must end
+        if elapsed >= TIMEOUT_SECONDS:
+            print(
+                f"[DEBUG] Timeout! Elapsed {elapsed:.1f}s >= {TIMEOUT_SECONDS}s, forcing end"
+            )
+            return "__end__"
+
+        # Hard limit: if we've reached max_steps, must end
+        if current_step >= max_steps_val:
+            print(
+                f"[DEBUG] Step {current_step} >= max_steps ({max_steps_val}), forcing end"
+            )
+            return "__end__"
 
         # If force_continue is True, agent must continue searching
         # This happens when early Final Answer was blocked
@@ -774,10 +933,12 @@ Continue your research now. DO NOT output Final Answer yet.
         "messages": input_messages,
         "plan": "",
         "step_index": 0,
+        "max_steps": max_steps,  # Store max_steps in state for consistency
         "pending_tool_calls": [],
         "emitted": [],
         "meta": {"searched_keywords": []},
         "force_continue": False,  # Initially False, set True when early Final Answer blocked
+        "start_time": time.time(),  # Record start time for timeout check
     }
 
     # We use stream_mode="updates" to get state updates from each node
