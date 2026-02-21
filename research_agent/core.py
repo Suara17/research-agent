@@ -383,10 +383,23 @@ async def agent_loop(
         current_step = state["step_index"]
         limit = state.get("max_steps", max_steps)
         start_time = state.get("start_time", time.time())
-        TIMEOUT_SECONDS = 600  # 10 minutes
+        limit = state.get("max_steps", max_steps)
+        TIMEOUT_SECONDS = 600  # 10 minutes timeout
+        TIMEOUT_BUFFER = (
+            70  # Stop 70 seconds before timeout to account for LLM call latency
+        )
+
+        elapsed = time.time() - start_time
 
         if current_step >= limit:
             return {"pending_tool_calls": [], "emitted": []}  # Stop
+
+        # If approaching timeout, force final answer immediately without calling LLM
+        if elapsed >= TIMEOUT_SECONDS - TIMEOUT_BUFFER:
+            print(
+                f"[DEBUG] Approaching timeout at step {current_step}, elapsed={elapsed:.1f}s, forcing end"
+            )
+            return {"pending_tool_calls": [], "emitted": []}  # Force end
 
         messages = state["messages"]
         plan = state["plan"]
@@ -398,8 +411,10 @@ async def agent_loop(
         # Timeout Check - if approaching timeout, force urgency mode
         elapsed = time.time() - start_time
         timeout_urgency_msg = ""
-        if elapsed >= TIMEOUT_SECONDS - 10:  # Last 1 minute before timeout
-            remaining = int(TIMEOUT_SECONDS - elapsed)
+        if (
+            elapsed >= TIMEOUT_SECONDS - TIMEOUT_BUFFER - 10
+        ):  # Start warning 20s before buffer
+            remaining = int(TIMEOUT_SECONDS - TIMEOUT_BUFFER - elapsed)
             timeout_urgency_msg = (
                 f"\n\n<timeout_urgency>\n"
                 f"  <warning>⏰ 超时警告: 剩余 {remaining} 秒!</warning>\n"
@@ -714,19 +729,18 @@ Alternative approach: [What I'll try instead]
 
         MIN_STEPS_BEFORE_FINAL = max(5, limit - 10)  # At least 5 steps before final
         FINAL_CHANCE_START = limit - 3  # Last 3 steps allow best-effort answer
+        TIMEOUT_SECONDS = 600
+        TIMEOUT_BUFFER = 10
 
-        # Check for verification table before Final Answer
-        print(
-            f"[DEBUG] Checking Final Answer at step {current_step}, content length: {len(content_buffer)}"
-        )
+        # Check timeout status
+        start_time = state.get("start_time", time.time())
+        elapsed = time.time() - start_time
 
-        # Track if we need to force continue (early Final Answer detected)
-        force_continue = False
-
-        # Check if we're in the "final chance" window (last 3 steps)
+        # Check if we're in the "final chance" window (last 3 steps) OR approaching timeout
+        # Also include a check for when elapsed is very close to timeout limit
         in_final_chance_window = (
             current_step >= FINAL_CHANCE_START and current_step < limit
-        )
+        ) or elapsed >= TIMEOUT_SECONDS - TIMEOUT_BUFFER
 
         if "Final Answer:" in content_buffer or "最终答案:" in content_buffer:
             print(f"[DEBUG] Final Answer DETECTED at step {current_step}")
@@ -773,6 +787,7 @@ Your answer will be accepted as the best-effort result. Make sure your answer is
 """
                     new_messages.append({"role": "system", "content": warning_msg})
                     # In final chance window, don't force continue - allow the answer
+                    force_continue = False
                 else:
                     print(
                         "[WARNING] Final answer without verification table! Forcing continue..."
@@ -843,6 +858,10 @@ If you reach step {MIN_STEPS_BEFORE_FINAL}, you will be allowed to output your b
                         f"\n\n[System] Answer Verification Error: {str(e)}"
                     )
 
+        # Default force_continue value if not set in any branch
+        if "force_continue" not in locals():
+            force_continue = False
+
         return {
             "messages": new_messages,
             "pending_tool_calls": pending_tool_calls,
@@ -873,16 +892,19 @@ If you reach step {MIN_STEPS_BEFORE_FINAL}, you will be allowed to output your b
             5, max_steps_val - 10
         )  # At least 5 steps before final
         TIMEOUT_SECONDS = 600  # 10 minutes timeout
+        TIMEOUT_BUFFER = (
+            70  # Stop 70 seconds before timeout to account for LLM call latency
+        )
 
         elapsed = time.time() - start_time
         print(
             f"[DEBUG] should_continue called: force_continue={force_continue_val}, pending_tool_calls={len(pending_calls) if pending_calls else 0}, step={current_step}/{max_steps_val}, elapsed={elapsed:.1f}s"
         )
 
-        # Timeout check: if elapsed time exceeds TIMEOUT_SECONDS, must end
-        if elapsed >= TIMEOUT_SECONDS:
+        # Timeout check: if elapsed time exceeds TIMEOUT_SECONDS - buffer, must end
+        if elapsed >= TIMEOUT_SECONDS - TIMEOUT_BUFFER:
             print(
-                f"[DEBUG] Timeout! Elapsed {elapsed:.1f}s >= {TIMEOUT_SECONDS}s, forcing end"
+                f"[DEBUG] Timeout! Elapsed {elapsed:.1f}s >= {TIMEOUT_SECONDS - TIMEOUT_BUFFER}s (buffer), forcing end"
             )
             return "__end__"
 

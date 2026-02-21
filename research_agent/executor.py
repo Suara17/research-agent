@@ -11,32 +11,162 @@ from .utils import get_llm_client
 from .schema import ToolCall, Chunk
 from .search import extract_answer_from_search_results
 
+# Pre-load jieba to avoid loading delay on each call
+try:
+    import jieba
+    import jieba.posseg as pseg
+
+    jieba.initialize()
+    _JIEBA_AVAILABLE = True
+except ImportError:
+    _JIEBA_AVAILABLE = False
+
 
 # 用于跟踪搜索循环的计数器
 _SEARCH_LOOP_COUNTER: Dict[str, int] = {}
 _MAX_LOOP_COUNT = 3  # 同一查询重复3次后触发换词
 
 
+def _extract_key_facts(content: str, max_length: int = 800) -> str:
+    """
+    Fast extraction of key facts from web content without LLM.
+    Uses jieba for better Chinese entity extraction + regex for numbers/dates.
+    """
+    if not content:
+        return ""
+
+    facts = []
+
+    # Extract dates first (regex is reliable)
+    date_patterns = [
+        r"(?:19|20)\d{2}年\d{1,2}月\d{1,2}日?",
+        r"(?:19|20)\d{2}年\d{1,2}月?",
+        r"(?:19|20)\d{2}年",
+        r"(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+(?:19|20)\d{2}",
+    ]
+    for pattern in date_patterns:
+        matches = re.findall(pattern, content, re.IGNORECASE)
+        for m in matches[:3]:
+            if m and m not in facts:
+                facts.append(m)
+
+    # Extract numbers with Chinese units (like 504个, 500人)
+    # Simple pattern that captures most cases
+    number_patterns = [
+        r"\d+\s*个",
+        r"\d+\s*名",
+        r"\d+\s*次",
+        r"\d+\s*件",
+        r"\d+\s*位",
+        r"\d+亿",
+        r"\d+万",
+    ]
+    for pattern in number_patterns:
+        matches = re.findall(pattern, content)
+        for m in matches[:3]:
+            if m and m not in facts:
+                facts.append(m)
+
+    # Use pre-loaded jieba for better entity extraction
+    if _JIEBA_AVAILABLE:
+        # Cut with part-of-speech tagging
+        words = pseg.cut(content[:5000])
+
+        # Collect entities by POS
+        entities = {
+            "nr": [],  # Person name
+            "ns": [],  # Place name
+            "nt": [],  # Organization
+            "nz": [],  # Other proper noun
+        }
+
+        for word, flag in words:
+            if len(word) >= 2:
+                if flag in entities and word not in facts:
+                    entities[flag].append(word)
+
+        # Add entities (person > place > org)
+        for etype in ["nr", "ns", "nt"]:
+            for e in entities[etype][:3]:
+                if e not in facts:
+                    facts.append(e)
+    else:
+        # Fallback to regex for Chinese entities
+        cn_entity_pattern = r"[\u4e00-\u9fff]{2,4}"
+        cn_entities = re.findall(cn_entity_pattern, content)
+        stop_words = {
+            "的",
+            "是",
+            "在",
+            "有",
+            "和",
+            "了",
+            "与",
+            "或",
+            "等",
+            "为",
+            "以",
+            "及",
+            "于",
+            "从",
+            "被",
+            "这",
+            "那",
+            "中",
+            "大",
+            "小",
+            "上",
+            "下",
+            "也",
+            "就",
+            "都",
+            "而",
+            "其",
+            "所",
+            "并",
+            "但",
+        }
+        filtered = [e for e in cn_entities if e not in stop_words and len(set(e)) > 1]
+        for entity in filtered[:5]:
+            if entity not in facts:
+                facts.append(entity)
+
+    # Extract quoted text
+    quoted = re.findall(r'"([^"]{10,80})"', content)
+    for q in quoted[:2]:
+        if q and q not in facts:
+            facts.append(q[:50])
+
+    result = " | ".join(facts[:8])
+
+    if len(result) > max_length:
+        result = result[:max_length] + "..."
+
+    return result
+
+
 def _detect_and_rewrite_query(query: str, search_history: List[str]) -> str:
     """
     检测搜索循环并尝试重写查询
-    
+
     Args:
         query: 原始查询
         search_history: 历史搜索记录
-        
+
     Returns:
         改进后的查询（如果检测到循环），否则返回原查询
     """
     # 归一化查询（去除空格，转小写）
     normalized_q = query.lower().strip()
-    
+
     # 检查是否在短时间内重复相同查询
     recent_same = [q for q in search_history[-5:] if q.lower().strip() == normalized_q]
-    
+
     if len(recent_same) >= _MAX_LOOP_COUNT:
-        print(f"[LoopDetection] Detected repeated query: '{query}' ({len(recent_same)} times)")
-        
+        print(
+            f"[LoopDetection] Detected repeated query: '{query}' ({len(recent_same)} times)"
+        )
+
         # 尝试生成替代查询
         try:
             client = get_llm_client()
@@ -59,17 +189,17 @@ def _detect_and_rewrite_query(query: str, search_history: List[str]) -> str:
                 model="qwen3-max",
                 messages=[{"role": "user", "content": rewrite_prompt}],
                 max_tokens=128,
-                temperature=0.7
+                temperature=0.7,
             )
-            
+
             new_query = resp.choices[0].message.content.strip().strip('"').strip("'")
-            
+
             if new_query and new_query != query:
                 print(f"[LoopDetection] Rewriting query: '{query}' -> '{new_query}'")
                 return new_query
         except Exception as e:
             print(f"[LoopDetection] Query rewrite failed: {e}")
-    
+
     return query
 
 
@@ -77,17 +207,23 @@ def _normalize_for_loop_detection(query: str) -> str:
     """归一化查询用于循环检测（忽略大小写和多余空格）"""
     return " ".join(query.lower().split())
 
+
 def execute_tools_logic(state: dict, tool_functions_map: dict, memory) -> dict:
     client = get_llm_client(timeout=30.0)
     emitted: List[Chunk] = state.get("emitted", [])
     new_messages = state["messages"][:]
-    meta = state.get("meta") or {"searched_keywords": [], "seen_entities": [], "last_skill_output": None, "dynamic_retrieval_count": 0}
+    meta = state.get("meta") or {
+        "searched_keywords": [],
+        "seen_entities": [],
+        "last_skill_output": None,
+        "dynamic_retrieval_count": 0,
+    }
     searched_before = set(meta.get("searched_keywords") or [])
 
     # Handle force_continue case: when early Final Answer was blocked
     # but no tool calls were made, we still need to increment step and reset flag
     force_continue = state.get("force_continue", False)
-    
+
     new_memory_items = []
     for tool_data in state.get("pending_tool_calls") or []:
         call_id = tool_data["id"]
@@ -95,22 +231,30 @@ def execute_tools_logic(state: dict, tool_functions_map: dict, memory) -> dict:
         func_args_str = tool_data["function"]["arguments"]
         tool_result_content = ""
         parsed_args = {}
-        tool_call = ToolCall(tool_call_id=call_id, tool_name=func_name, tool_arguments={})
+        tool_call = ToolCall(
+            tool_call_id=call_id, tool_name=func_name, tool_arguments={}
+        )
         try:
             parsed_args = json.loads(func_args_str)
             tool_call.tool_arguments = parsed_args
-            emitted.append(Chunk(step_index=state["step_index"], type="tool_call", tool_call=tool_call))
-            
+            emitted.append(
+                Chunk(
+                    step_index=state["step_index"],
+                    type="tool_call",
+                    tool_call=tool_call,
+                )
+            )
+
             if func_name == "web_search":
                 q0 = str(parsed_args.get("query") or "")
-                
+
                 # === 搜索循环检测与重写 ===
                 # 获取搜索历史
                 search_history = meta.get("searched_keywords", [])
-                
+
                 # 检测并可能重写查询
                 rewritten_query = _detect_and_rewrite_query(q0, search_history)
-                
+
                 if rewritten_query != q0:
                     # 查询被重写，更新参数
                     parsed_args["query"] = rewritten_query
@@ -119,7 +263,7 @@ def execute_tools_logic(state: dict, tool_functions_map: dict, memory) -> dict:
                     func_args_str = json.dumps(parsed_args)
                     tool_call.tool_arguments = parsed_args
                     print(f"[Executor] Using rewritten query: '{rewritten_query}'")
-                
+
                 # 原有相似度检测（保留作为额外检查）
                 sim_high = False
                 for old_q in searched_before:
@@ -127,9 +271,9 @@ def execute_tools_logic(state: dict, tool_functions_map: dict, memory) -> dict:
                         sim_high = True
                         break
                 if sim_high:
-                     # Warn but allow if it's not exact duplicate
-                     print(f"[Executor] Warning: Similar search '{q0}' detected.")
-            
+                    # Warn but allow if it's not exact duplicate
+                    print(f"[Executor] Warning: Similar search '{q0}' detected.")
+
             if func_name in tool_functions_map and not tool_result_content:
                 func = tool_functions_map[func_name]
                 attempt = 0
@@ -150,37 +294,56 @@ def execute_tools_logic(state: dict, tool_functions_map: dict, memory) -> dict:
             else:
                 if func_name not in tool_functions_map:
                     tool_result_content = f"Error: Tool '{func_name}' not found."
-                    
+
         except json.JSONDecodeError as e:
             tool_result_content = f"Error: Failed to parse tool arguments JSON: {func_args_str}. Error: {e}"
-            emitted.append(Chunk(step_index=state["step_index"], type="tool_call", tool_call=tool_call))
+            emitted.append(
+                Chunk(
+                    step_index=state["step_index"],
+                    type="tool_call",
+                    tool_call=tool_call,
+                )
+            )
         except Exception as e:
             tool_result_content = f"Error: Execution failed - {str(e)}"
-        
+
         msg_display_content = tool_result_content
 
-        # Simple summarization for long content
-        if func_name in ["web_fetch", "browse_page"] and len(tool_result_content) > 1000:
-            distill_instruction = "<instruction><task>Summarize key facts from the text.</task><details>Extract entities, dates, numbers; remove ads and navigation.</details></instruction>"
+        # Fast extraction instead of LLM summarization for long content
+        if (
+            func_name in ["web_fetch", "browse_page"]
+            and len(tool_result_content) > 1000
+        ):
             try:
-                distill_resp = client.chat.completions.create(
-                    model="qwen3-max",
-                    messages=[
-                        {"role": "system", "content": distill_instruction},
-                        {"role": "user", "content": f"<input><text>{tool_result_content[:4000]}</text></input>"}
-                    ],
-                    max_tokens=512
-                )
-                summary = distill_resp.choices[0].message.content
-                memory.add_long(f"Fact Summary from {parsed_args.get('url')}: {summary}")
-                msg_display_content = f"[Fact Summary from {parsed_args.get('url')}]:\n{summary}"
+                # Extract key facts (for quick recall)
+                facts = _extract_key_facts(tool_result_content)
+
+                # Store BOTH: extracted facts + truncated original content
+                if facts and len(facts) > 20:
+                    # Truncate original content for backup (first 2000 chars)
+                    truncated = tool_result_content[:2000]
+                    memory.add_long(
+                        f"[Facts] {facts}\n\n[Original Truncated]\n{truncated}"
+                    )
+                    msg_display_content = f"[Key Facts]: {facts}\n\n[Content Preview]: {truncated[:500]}..."
+                else:
+                    memory.add_long(tool_result_content)
             except Exception as e:
                 memory.add_long(tool_result_content)
         else:
             memory.add_long(tool_result_content)
 
-        emitted.append(Chunk(type="tool_call_result", tool_result=msg_display_content, step_index=state["step_index"], tool_call=tool_call))
-        new_messages.append({"role": "tool", "tool_call_id": call_id, "content": msg_display_content})
+        emitted.append(
+            Chunk(
+                type="tool_call_result",
+                tool_result=msg_display_content,
+                step_index=state["step_index"],
+                tool_call=tool_call,
+            )
+        )
+        new_messages.append(
+            {"role": "tool", "tool_call_id": call_id, "content": msg_display_content}
+        )
         memory.add_short(msg_display_content)
 
         if func_name == "web_search":
