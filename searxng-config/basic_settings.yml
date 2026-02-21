@@ -1,0 +1,28 @@
+general:
+  debug: false
+  instance_name: 'SearXNG for Research Agent'
+  enable_metrics: false
+
+search:
+  safe_search: 0
+  default_lang: 'auto'
+  max_page: 0
+  default_categories: ['general']
+
+server:
+  base_url: 'http://localhost:8083/'
+  port: 8080
+  bind_address: '0.0.0.0'
+  secret_key: 'abcdefghijklmnopqrstuvwxyz0123456789'
+  limiter: false
+  public_instance: false
+
+outgoing:
+  request_timeout: 2.0
+  max_request_timeout: 10.0
+
+# 不启用任何插件
+enabled_plugins: []
+
+# 不配置任何引擎
+engines: []

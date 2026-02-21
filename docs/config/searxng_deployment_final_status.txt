@@ -1,0 +1,37 @@
+# SearXNG 部署完成！
+
+## 部署状态
+✅ SearXNG 服务已在 http://localhost:8083 上成功运行
+
+## 配置详情
+- 端口: 8083 (映射到容器的8080端口)
+- 实例名称: SearXNG for Research Agent (使用默认配置)
+- 限制器: 已禁用 (limiter: false)
+- 公共实例: 已禁用 (通过环境变量 SEARXNG_PUBLIC_INSTANCE=false)
+
+## 当前状态
+- Web界面: ✅ 可用 (访问 http://localhost:8083/)
+- API搜索: ❌ 遇到403错误，由于SearXNG的bot detection机制
+
+## 问题说明
+虽然SearXNG服务已成功运行，但我们遇到了403 Forbidden错误，这是由于SearXNG的bot detection功能，
+即使在私有实例模式下也会检查X-Forwarded-For或X-Real-IP头。
+
+## 解决方案
+要使API完全可用，需要通过反向代理添加适当的HTTP头：
+
+1. 使用Nginx或Apache作为反向代理
+2. 或者在Research Agent代码中添加适当的HTTP头
+
+## 为Research Agent配置
+将以下环境变量添加到Research Agent的配置中：
+SEARXNG_BASE_URL=http://localhost:8083/
+
+## 服务管理
+- 检查状态: docker ps
+- 停止服务: docker stop searxng-agent
+- 重启服务: docker restart searxng-agent
+
+## 验证
+- Web界面: http://localhost:8083/ (应该正常工作)
+- API测试: 需要适当的HTTP头 (X-Forwarded-For, X-Real-IP)

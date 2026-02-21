@@ -1,0 +1,49 @@
+general:
+  debug: false
+  instance_name: 'SearXNG for Research Agent'
+
+search:
+  safe_search: 0
+  default_lang: 'auto'
+  max_page: 0
+  default_categories: ['general']
+
+server:
+  base_url: 'http://localhost:8083/'
+  port: 8080
+  bind_address: '0.0.0.0'
+  secret_key: 'c2a7a4718eabb5bf290bd1e641c7c9d580877b3738e668a053e4e948792e3e4a'
+  limiter: false
+  public_instance: false
+
+outgoing:
+  request_timeout: 5.00
+  max_request_timeout: 15.0
+
+redis:
+  url: false
+
+enabled_plugins:
+  - 'self_info'
+
+engines:
+  - name: duckduckgo
+    enabled: true
+    shortcut: d
+    timeout: 5.0
+    weight: 1
+    categories: [general, web]
+
+  - name: bing
+    enabled: true
+    shortcut: b
+    timeout: 5.0
+    weight: 1
+    categories: [general, web]
+
+  - name: qwant
+    enabled: true
+    shortcut: qw
+    timeout: 5.0
+    weight: 1
+    categories: [general, web]

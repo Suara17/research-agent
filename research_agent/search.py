@@ -8,6 +8,7 @@ from curl_cffi import requests
 # 加载 .env 文件（如果存在）
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except ImportError:
     pass
@@ -33,6 +34,7 @@ except ImportError:
     # 尝试使用旧包名
     try:
         from duckduckgo_search import DDGS as _DDGS
+
         _DDGS_AVAILABLE = True
     except ImportError:
         _DDGS_AVAILABLE = False
@@ -114,6 +116,258 @@ _GLOBAL_SESSION.headers.update(
         "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
     }
 )
+
+# --- SearXNG 引擎组合配置 ---
+# 根据查询类型推荐不同的搜索引擎组合
+SEARXNG_ENGINE_PRESETS = {
+    "general": "bing,duckduckgo,google",
+    "academic": "arxiv,google scholar,pubmed,semantic scholar",
+    "code": "github,askubuntu,superuser",
+    "video": "youtube,peertube,vimeo",
+    "images": "bing images,google images",
+    "news": "bing news,google news",
+    "it": "github,askubuntu,superuser,stackexchange",
+    "science": "arxiv,google scholar,pubmed,crossref",
+}
+
+# 查询类型关键词映射
+_QUERY_TYPE_KEYWORDS = {
+    "academic": [
+        "paper",
+        "research",
+        "study",
+        "论文",
+        "研究",
+        "学术",
+        "arxiv",
+        "publication",
+        "journal",
+        "article",
+        "期刊",
+        "文献",
+        "cite",
+        "author",
+        "作者",
+        "引用",
+        "study on",
+        "analysis of",
+        "phd",
+        "doctoral",
+        "thesis",
+        "dissertation",
+        "博士",
+        "硕士",
+        "machine learning",
+        "deep learning",
+        "neural network",
+        "AI",
+        "algorithm",
+        "模型",
+        "算法",
+        "experiment",
+        "实验",
+    ],
+    "code": [
+        "github",
+        "repository",
+        "code",
+        "代码",
+        "编程",
+        "programming",
+        "python",
+        "javascript",
+        "java",
+        "cpp",
+        "rust",
+        "golang",
+        "error",
+        "bug",
+        "fix",
+        "debug",
+        "错误",
+        "修复",
+        "install",
+        "安装",
+        "package",
+        "库",
+        "library",
+        "module",
+        "api",
+        "function",
+        "函数",
+        "class",
+        "类",
+        "method",
+        "stack overflow",
+        "stackoverflow",
+        "askubuntu",
+        "superuser",
+        "how to",
+        "怎么",
+        "如何",
+        "tutorial",
+        "教程",
+    ],
+    "video": [
+        "video",
+        "视频",
+        "youtube",
+        "movie",
+        "电影",
+        "film",
+        "watch",
+        "观看",
+        "stream",
+        "直播",
+        "live",
+        "tutorial video",
+        "教程视频",
+        "course",
+        "课程",
+        "纪录片",
+        "documentary",
+        "clip",
+        "片段",
+    ],
+    "images": [
+        "image",
+        "图片",
+        "photo",
+        "照片",
+        "picture",
+        "图",
+        "wallpaper",
+        "壁纸",
+        "screenshot",
+        "截图",
+        "logo",
+        "图标",
+        "icon",
+        "设计图",
+    ],
+    "news": [
+        "news",
+        "新闻",
+        "latest",
+        "最新",
+        "recent",
+        "breaking",
+        "today",
+        "今天",
+        "yesterday",
+        "昨天",
+        "this week",
+        "report",
+        "报道",
+        "announce",
+        "宣布",
+        "发布",
+    ],
+    "science": [
+        "science",
+        "科学",
+        "biology",
+        "生物",
+        "chemistry",
+        "化学",
+        "physics",
+        "物理",
+        "medicine",
+        "医学",
+        "health",
+        "健康",
+        "experiment",
+        "实验",
+        "hypothesis",
+        "假设",
+        "theory",
+        "理论",
+        "discovery",
+        "发现",
+        "species",
+        "物种",
+        "cell",
+        "细胞",
+    ],
+    "it": [
+        "software",
+        "软件",
+        "hardware",
+        "硬件",
+        "computer",
+        "电脑",
+        "linux",
+        "ubuntu",
+        "windows",
+        "macos",
+        "操作系统",
+        "server",
+        "服务器",
+        "network",
+        "网络",
+        "database",
+        "数据库",
+        "docker",
+        "kubernetes",
+        "cloud",
+        "云",
+        "devops",
+        "security",
+        "安全",
+        "encryption",
+        "加密",
+        "api",
+        "interface",
+        "接口",
+        "backend",
+        "frontend",
+    ],
+}
+
+
+def _detect_query_type(query: str) -> str:
+    """
+    检测查询类型，返回推荐的引擎组合名称
+
+    Args:
+        query: 搜索查询字符串
+
+    Returns:
+        str: 查询类型 (general, academic, code, video, images, news, it, science)
+    """
+    query_lower = query.lower()
+
+    # 统计各类型的关键词匹配数
+    type_scores = {}
+    for query_type, keywords in _QUERY_TYPE_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw.lower() in query_lower)
+        if score > 0:
+            type_scores[query_type] = score
+
+    # 如果没有匹配，返回通用类型
+    if not type_scores:
+        return "general"
+
+    # 返回得分最高的类型
+    best_type = max(type_scores, key=type_scores.get)
+    return best_type
+
+
+def _get_engines_for_query(query: str) -> str:
+    """
+    根据查询内容获取推荐的搜索引擎组合
+
+    Args:
+        query: 搜索查询字符串
+
+    Returns:
+        str: 逗号分隔的引擎列表
+    """
+    query_type = _detect_query_type(query)
+    engines = SEARXNG_ENGINE_PRESETS.get(query_type, SEARXNG_ENGINE_PRESETS["general"])
+    print(f"[SearXNG] Query type: {query_type}, Engines: {engines}")
+    return engines
+
 
 # --- Helpers ---
 
@@ -267,7 +521,7 @@ def _fetch_with_drission(url: str) -> Optional[str]:
 def _compress_fetched_content(content: str, max_length: int = 5000) -> str:
     """
     压缩抓取的网页内容，保留关键信息
-    
+
     策略：
     1. 如果内容 <= max_length，直接返回
     2. 尝试使用关键句子提取（保留核心信息）
@@ -275,23 +529,25 @@ def _compress_fetched_content(content: str, max_length: int = 5000) -> str:
     """
     if not content:
         return content
-    
+
     # 如果内容已经足够短，直接返回
     if len(content) <= max_length:
         return content
-    
+
     # 尝试使用关键句子提取方法
     try:
         # 导入已在文件顶部
-        key_sentences = extract_key_sentences(content, max_length=max_length, num_sentences=6)
+        key_sentences = extract_key_sentences(
+            content, max_length=max_length, num_sentences=6
+        )
         if key_sentences and len(key_sentences) > 50:  # 确保提取到有效内容
             return key_sentences
     except Exception:
         pass
-    
+
     # 如果关键句子提取失败，使用位置截断
-    truncated = content[:max_length * 2]  # 先取2倍长度
-    
+    truncated = content[: max_length * 2]  # 先取2倍长度
+
     # 尝试在句子边界处截断
     sentence_ends = [
         truncated.rfind("。"),
@@ -302,16 +558,16 @@ def _compress_fetched_content(content: str, max_length: int = 5000) -> str:
         truncated.rfind("?\n"),
     ]
     last_end = max(sentence_ends)
-    
+
     if last_end > max_length * 0.7:  # 确保截断位置合理
-        result = truncated[:last_end + 1]
+        result = truncated[: last_end + 1]
     else:
         result = truncated[:max_length]
-    
+
     # 添加省略提示
     if len(content) > len(result):
         result += "\n\n[...内容已压缩，原始长度: {} 字符...]".format(len(content))
-    
+
     return result
 
 
@@ -358,7 +614,7 @@ _WIKI_CACHE_TTL = 86400  # Wikipedia 缓存24小时
 # Wikipedia 镜像列表
 _WIKI_MIRRORS = [
     "https://en.wikipedia.org",
-    "https://zh.wikipedia.org", 
+    "https://zh.wikipedia.org",
     "https://ja.wikipedia.org",
     "https://de.wikipedia.org",
     "https://fr.wikipedia.org",
@@ -718,27 +974,30 @@ _WIKI_ENTITY_PATTERNS = [
     r"\s(是谁|是什么|在哪|建于)",
 ]
 
+
 # 检测是否为实体类查询
 def _is_entity_query(query: str) -> bool:
     """检测查询是否为实体类查询（人名、地名、书名等）"""
     query_lower = query.lower().strip()
-    
+
     # 检查是否匹配 Wikipedia 实体查询模式
     for pattern in _WIKI_ENTITY_PATTERNS:
         if re.match(pattern, query, re.IGNORECASE):
             return True
-    
+
     # 检查是否包含明显的实体标识
     entity_indicators = [
-        '"', '《', '》',  # 引号、书名号
+        '"',
+        "《",
+        "》",  # 引号、书名号
     ]
     if any(indicator in query for indicator in entity_indicators):
         return True
-    
+
     # 检查是否以问号结尾（通常是实体查询）
-    if query.strip().endswith('?'):
+    if query.strip().endswith("?"):
         return True
-    
+
     return False
 
 
@@ -1044,26 +1303,26 @@ def _extract_search_slots(query: str) -> dict:
 def _fallback_slot_extraction(query: str) -> dict:
     """简单的降级槽位提取方案"""
     import re
-    
+
     # 检测语言
     is_chinese = any("\u4e00" <= ch <= "\u9fff" for ch in query)
-    
+
     # 提取年份
     years = re.findall(r"\b(19|20)\d{2}s?\b", query)
-    
+
     # 提取引号中的内容
     quoted = re.findall(r'"([^"]+)"', query)
-    
+
     # 提取书名号中的内容
     books = re.findall(r"《([^》]+)》", query)
-    
+
     anchors = quoted + books
-    
+
     return {
         "type": "Unknown",
         "hard_constraints": years if years else [],
         "anchors": anchors,
-        "target_country": None
+        "target_country": None,
     }
 
 
@@ -1093,10 +1352,10 @@ def _fetch_wikipedia_with_cache(url: str) -> Optional[dict]:
     p = urllib.parse.urlparse(url)
     host = p.netloc
     title = _wiki_title_from_path(p.path)
-    
+
     if not host or not title:
         return None
-    
+
     # 提取语言代码
     lang = "en"
     if "zh.wikipedia.org" in host:
@@ -1107,9 +1366,9 @@ def _fetch_wikipedia_with_cache(url: str) -> Optional[dict]:
         lang = "de"
     elif "fr.wikipedia.org" in host:
         lang = "fr"
-    
+
     cache_key = _get_wiki_cache_key(title, lang)
-    
+
     # 检查缓存（24小时有效期）
     if cache_key in _WIKI_FETCH_CACHE:
         cached_data, cached_time = _WIKI_FETCH_CACHE[cache_key]
@@ -1118,7 +1377,7 @@ def _fetch_wikipedia_with_cache(url: str) -> Optional[dict]:
             return cached_data
         else:
             del _WIKI_FETCH_CACHE[cache_key]
-    
+
     # 尝试从原始主机获取
     result = _fetch_wikipedia_from_host(host, title)
     if result:
@@ -1126,10 +1385,12 @@ def _fetch_wikipedia_with_cache(url: str) -> Optional[dict]:
         _WIKI_FETCH_CACHE[cache_key] = (result, time.time())
         # 限制缓存大小
         if len(_WIKI_FETCH_CACHE) > _WIKI_CACHE_LIMIT:
-            oldest_key = min(_WIKI_FETCH_CACHE.keys(), key=lambda k: _WIKI_FETCH_CACHE[k][1])
+            oldest_key = min(
+                _WIKI_FETCH_CACHE.keys(), key=lambda k: _WIKI_FETCH_CACHE[k][1]
+            )
             del _WIKI_FETCH_CACHE[oldest_key]
         return result
-    
+
     # 如果原始主机失败，尝试镜像
     print(f"[Wiki] Primary host failed, trying mirrors for {title}")
     for mirror in _WIKI_MIRRORS:
@@ -1140,7 +1401,7 @@ def _fetch_wikipedia_with_cache(url: str) -> Optional[dict]:
             # 存入缓存
             _WIKI_FETCH_CACHE[cache_key] = (result, time.time())
             return result
-    
+
     return None
 
 
@@ -1163,7 +1424,7 @@ def _fetch_wikipedia_from_host(host: str, title: str) -> Optional[dict]:
             }
     except Exception as e:
         pass
-    
+
     try:
         # 尝试 PHP API
         api_php = f"https://{host}/w/api.php?action=query&format=json&prop=extracts&titles={urllib.parse.quote(title)}&exintro=1&explaintext=1"
@@ -1183,7 +1444,7 @@ def _fetch_wikipedia_from_host(host: str, title: str) -> Optional[dict]:
                 }
     except Exception as e:
         pass
-    
+
     return None
 
 
@@ -1258,58 +1519,60 @@ def _safe_search_bocha(query: str, k: int) -> List[Dict]:
     """封装博查(Bocha) API搜索，用于中文查询"""
     if not _BOCHA_AVAILABLE:
         return []
-    
+
     try:
         # 构建请求
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
-        
+
         data = {
             "query": query,
             "count": k,
             "page": 1,
             "webPages": True,
             "news": False,
-            "relatedLinks": False
+            "relatedLinks": False,
         }
-        
-        json_data = json.dumps(data).encode('utf-8')
-        
+
+        json_data = json.dumps(data).encode("utf-8")
+
         req = urllib.request.Request(
             _BOCHA_API_URL,
             data=json_data,
             headers={
                 "Authorization": f"Bearer {_BOCHA_API_KEY}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
             },
-            method="POST"
+            method="POST",
         )
-        
+
         with urllib.request.urlopen(req, timeout=30, context=ssl_context) as response:
-            result = response.read().decode('utf-8')
+            result = response.read().decode("utf-8")
             data = json.loads(result)
-        
+
         if data.get("code") != 200:
             print(f"[Search] Bocha API error: {data.get('msg')}")
             return []
-        
+
         web_pages = data.get("data", {}).get("webPages", {}).get("value", [])
-        
+
         results = []
         for i, item in enumerate(web_pages):
             if i >= k:
                 break
-            results.append({
-                "title": item.get("name", ""),
-                "summary": item.get("snippet", ""),
-                "url": item.get("url", ""),
-                "source": "bocha",
-                "score": 1.0 - (i * 0.1),
-            })
-        
+            results.append(
+                {
+                    "title": item.get("name", ""),
+                    "summary": item.get("snippet", ""),
+                    "url": item.get("url", ""),
+                    "source": "bocha",
+                    "score": 1.0 - (i * 0.1),
+                }
+            )
+
         return _filter_search_results(results)
-        
+
     except Exception as e:
         print(f"[Search] Bocha failed: {e}")
         return []
@@ -1321,7 +1584,7 @@ def _resolve_360_redirect(url: str, session) -> str:
     """
     if not url or "so.com/link" not in url:
         return url
-    
+
     try:
         # 使用HEAD请求快速获取跳转目标
         resp = session.head(url, allow_redirects=True, timeout=5)
@@ -1329,19 +1592,21 @@ def _resolve_360_redirect(url: str, session) -> str:
             return resp.url
     except Exception as e:
         print(f"[360] Failed to resolve redirect: {e}")
-    
+
     # 如果HEAD失败，尝试从URL参数中提取
     try:
         from urllib.parse import parse_qs, urlparse
+
         parsed = urlparse(url)
         params = parse_qs(parsed.query)
         # 尝试获取url参数
-        if 'url' in params:
+        if "url" in params:
             import urllib.parse
-            return urllib.parse.unquote(params['url'][0])
+
+            return urllib.parse.unquote(params["url"][0])
     except:
         pass
-    
+
     return url
 
 
@@ -1357,64 +1622,70 @@ def _safe_search_360(query: str, k: int) -> List[Dict]:
             "q": query,
             "pn": 1,
         }
-        
+
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
-        
+
         resp = _GLOBAL_SESSION.get(url, params=params, headers=headers, timeout=8)
-        
+
         if resp.status_code != 200:
             print(f"[Search] 360 search failed with status: {resp.status_code}")
             return []
-        
+
         # 使用BeautifulSoup解析HTML获取搜索结果
         soup = BeautifulSoup(resp.text, "html.parser")
         results = []
-        
+
         # 360搜索结果: li.res-list
         result_items = soup.select("li.res-list")
-        
+
         for i, item in enumerate(result_items):
             if i >= k:
                 break
-            
+
             # 获取标题 - h3 a
             title_elem = item.select_one("h3 a")
             if not title_elem:
                 continue
-            
+
             title = title_elem.get_text(strip=True)
             url_link = title_elem.get("href", "")
-            
+
             # 解析360搜索跳转链接，获取真实URL
             if "so.com/link" in url_link:
                 url_link = _resolve_360_redirect(url_link, _GLOBAL_SESSION)
-            
+
             # 获取摘要 - p.res-desc 或 div.vw-desc
-            summary_elem = item.select_one("p.res-desc") or item.select_one("div.vw-desc") or item.select_one("div.str-text")
+            summary_elem = (
+                item.select_one("p.res-desc")
+                or item.select_one("div.vw-desc")
+                or item.select_one("div.str-text")
+            )
             summary = summary_elem.get_text(strip=True) if summary_elem else ""
-            
+
             # 跳过空结果
             if not title:
                 continue
-            
-            results.append({
-                "title": title,
-                "summary": summary,
-                "url": url_link,
-                "source": "360",
-                "score": 0.9 - (i * 0.1),
-            })
-        
+
+            results.append(
+                {
+                    "title": title,
+                    "summary": summary,
+                    "url": url_link,
+                    "source": "360",
+                    "score": 0.9 - (i * 0.1),
+                }
+            )
+
         if results:
             print(f"[Search] Got {len(results)} results from 360 search")
             return _filter_search_results(results)
-        
+
         return []
-        
+
     except Exception as e:
         print(f"[Search] 360 search failed: {e}")
         return []
@@ -1432,60 +1703,70 @@ def _safe_search_sogou(query: str, k: int) -> List[Dict]:
             "query": query,
             "page": 1,
         }
-        
+
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
-        
+
         resp = _GLOBAL_SESSION.get(url, params=params, headers=headers, timeout=8)
-        
+
         if resp.status_code != 200:
             print(f"[Search] Sogou search failed with status: {resp.status_code}")
             return []
-        
+
         # 解析HTML获取搜索结果
         soup = BeautifulSoup(resp.text, "html.parser")
         results = []
-        
+
         # 搜狗搜索结果在 <div class="vrwrap"> 或 <div class="rb">
         result_items = soup.select("div.vrwrap") or soup.select("div.rb")
-        
+
         for i, item in enumerate(result_items):
             if i >= k:
                 break
-            
+
             # 获取标题
-            title_elem = item.select_one("h3.pt a") or item.select_one("h3 a") or item.select_one("a[href*='sogou.com']")
+            title_elem = (
+                item.select_one("h3.pt a")
+                or item.select_one("h3 a")
+                or item.select_one("a[href*='sogou.com']")
+            )
             if not title_elem:
                 continue
-            
+
             title = title_elem.get_text(strip=True)
             url_link = title_elem.get("href", "")
-            
+
             # 获取摘要
-            summary_elem = item.select_one("div.str-text") or item.select_one("p.str-text") or item.select_one("div.str-info")
+            summary_elem = (
+                item.select_one("div.str-text")
+                or item.select_one("p.str-text")
+                or item.select_one("div.str-info")
+            )
             summary = summary_elem.get_text(strip=True) if summary_elem else ""
-            
+
             # 跳过空结果
             if not title:
                 continue
-            
-            results.append({
-                "title": title,
-                "summary": summary,
-                "url": url_link,
-                "source": "sogou",
-                "score": 0.85 - (i * 0.1),
-            })
-        
+
+            results.append(
+                {
+                    "title": title,
+                    "summary": summary,
+                    "url": url_link,
+                    "source": "sogou",
+                    "score": 0.85 - (i * 0.1),
+                }
+            )
+
         if results:
             print(f"[Search] Got {len(results)} results from Sogou search")
             return _filter_search_results(results)
-        
+
         return []
-        
+
     except Exception as e:
         print(f"[Search] Sogou search failed: {e}")
         return []
@@ -1497,7 +1778,7 @@ def _resolve_baidu_redirect(url: str, session) -> str:
     """
     if not url or "baidu.com/link" not in url:
         return url
-    
+
     try:
         # 使用HEAD请求快速获取跳转目标
         resp = session.head(url, allow_redirects=True, timeout=5)
@@ -1505,20 +1786,21 @@ def _resolve_baidu_redirect(url: str, session) -> str:
             return resp.url
     except Exception as e:
         print(f"[Baidu] Failed to resolve redirect: {e}")
-    
+
     # 如果HEAD失败，尝试从URL参数中提取
     try:
         from urllib.parse import parse_qs, urlparse
+
         parsed = urlparse(url)
         params = parse_qs(parsed.query)
         # 尝试获取bdUrl参数
-        if 'bdUrl' in params:
-            return params['bdUrl'][0]
-        if 'url' in params:
-            return params['url'][0]
+        if "bdUrl" in params:
+            return params["bdUrl"][0]
+        if "url" in params:
+            return params["url"][0]
     except:
         pass
-    
+
     return url
 
 
@@ -1535,64 +1817,72 @@ def _safe_search_baidu_direct(query: str, k: int) -> List[Dict]:
             "pn": 0,
             "rn": k,
         }
-        
+
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
-        
-        resp = _GLOBAL_SESSION.get(search_url, params=params, headers=headers, timeout=8)
-        
+
+        resp = _GLOBAL_SESSION.get(
+            search_url, params=params, headers=headers, timeout=8
+        )
+
         if resp.status_code != 200:
-            print(f"[Search] Baidu direct search failed with status: {resp.status_code}")
+            print(
+                f"[Search] Baidu direct search failed with status: {resp.status_code}"
+            )
             return []
-        
+
         # 解析HTML获取搜索结果
         soup = BeautifulSoup(resp.text, "html.parser")
         results = []
-        
+
         # 百度搜索结果在 <div class="result">
         result_items = soup.select("div.result")
-        
+
         for i, item in enumerate(result_items):
             if i >= k:
                 break
-            
+
             # 获取标题和链接
             title_elem = item.select_one("h3.t a")
             if not title_elem:
                 continue
-            
+
             title = title_elem.get_text(strip=True)
             url_link = title_elem.get("href", "")
-            
+
             # 解析百度跳转链接，获取真实URL
             if "baidu.com/link" in url_link:
                 url_link = _resolve_baidu_redirect(url_link, _GLOBAL_SESSION)
-            
+
             # 获取摘要
-            summary_elem = item.select_one("div.c-abstract") or item.select_one("div.result-info")
+            summary_elem = item.select_one("div.c-abstract") or item.select_one(
+                "div.result-info"
+            )
             summary = summary_elem.get_text(strip=True) if summary_elem else ""
-            
+
             # 跳过空结果
             if not title:
                 continue
-            
-            results.append({
-                "title": title,
-                "summary": summary,
-                "url": url_link,
-                "source": "baidu_direct",
-                "score": 0.95 - (i * 0.1),
-            })
-        
+
+            results.append(
+                {
+                    "title": title,
+                    "summary": summary,
+                    "url": url_link,
+                    "source": "baidu_direct",
+                    "score": 0.95 - (i * 0.1),
+                }
+            )
+
         if results:
             print(f"[Search] Got {len(results)} results from Baidu direct search")
             return _filter_search_results(results)
-        
+
         return []
-        
+
     except Exception as e:
         print(f"[Search] Baidu direct search failed: {e}")
         return []
@@ -1609,60 +1899,62 @@ def _safe_search_toutiao(query: str, k: int) -> List[Dict]:
         params = {
             "keyword": query,
         }
-        
+
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
-        
+
         resp = _GLOBAL_SESSION.get(url, params=params, headers=headers, timeout=8)
-        
+
         if resp.status_code != 200:
             print(f"[Search] Toutiao search failed with status: {resp.status_code}")
             return []
-        
+
         # 解析HTML获取搜索结果
         soup = BeautifulSoup(resp.text, "html.parser")
         results = []
-        
+
         # 头条搜索结果
         result_items = soup.select("div.result-box") or soup.select("li.item")
-        
+
         for i, item in enumerate(result_items):
             if i >= k:
                 break
-            
+
             # 获取标题
             title_elem = item.select_one("div.title a") or item.select_one("a.title")
             if not title_elem:
                 continue
-            
+
             title = title_elem.get_text(strip=True)
             url_link = title_elem.get("href", "")
-            
+
             # 获取摘要
             summary_elem = item.select_one("div.info") or item.select_one("p.info")
             summary = summary_elem.get_text(strip=True) if summary_elem else ""
-            
+
             # 跳过空结果
             if not title:
                 continue
-            
-            results.append({
-                "title": title,
-                "summary": summary,
-                "url": url_link,
-                "source": "toutiao",
-                "score": 0.8 - (i * 0.1),
-            })
-        
+
+            results.append(
+                {
+                    "title": title,
+                    "summary": summary,
+                    "url": url_link,
+                    "source": "toutiao",
+                    "score": 0.8 - (i * 0.1),
+                }
+            )
+
         if results:
             print(f"[Search] Got {len(results)} results from Toutiao search")
             return _filter_search_results(results)
-        
+
         return []
-        
+
     except Exception as e:
         print(f"[Search] Toutiao search failed: {e}")
         return []
@@ -1746,8 +2038,17 @@ def _safe_search_serper(
     return []
 
 
-def _safe_search_searxng(query: str, k: int, base_url: str) -> List[Dict]:
-    """封装 SearXNG 搜索"""
+def _safe_search_searxng(
+    query: str, k: int, base_url: str, engines: str = None
+) -> List[Dict]:
+    """封装 SearXNG 搜索
+
+    Args:
+        query: 搜索查询
+        k: 返回结果数量
+        base_url: SearXNG 服务地址
+        engines: 指定的搜索引擎组合，如 "bing,duckduckgo,google"。如果不指定则自动检测
+    """
     try:
         searxng_url = f"{base_url.rstrip('/')}/search"
 
@@ -1765,6 +2066,14 @@ def _safe_search_searxng(query: str, k: int, base_url: str) -> List[Dict]:
             "language": "en-US" if use_english else "zh-CN",
         }
 
+        # 如果没有指定引擎，则根据查询类型自动选择
+        if engines:
+            params["engines"] = engines
+            print(f"[SearXNG] Using specified engines: {engines}")
+        else:
+            auto_engines = _get_engines_for_query(query)
+            params["engines"] = auto_engines
+
         # 添加适当的HTTP头来绕过SearXNG的bot detection
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -1775,9 +2084,11 @@ def _safe_search_searxng(query: str, k: int, base_url: str) -> List[Dict]:
         }
 
         # Use Global Session with custom headers
+        # 增加超时时间以适应代理环境
         resp = _GLOBAL_SESSION.get(
-            searxng_url, params=params, headers=headers, timeout=8
-        )  # 增加超时时间
+            searxng_url, params=params, headers=headers, timeout=30
+        )
+        print(f"[SearXNG] Response status: {resp.status_code}")
         if resp.status_code == 200:
             data = resp.json()
             raw_results = []
@@ -1807,17 +2118,22 @@ def _safe_search_searxng(query: str, k: int, base_url: str) -> List[Dict]:
                         "url": item.get("url"),
                         "source": item.get("engine", "searxng"),
                         "engine": item.get("engine", "searxng"),
-                        "score": 0.95 - (i * 0.1),  # Slightly lower base than Google
+                        "score": 0.95 - (i * 0.1),
                     }
                 )
 
-            # 使用评分系统对结果进行筛选和排序
             filtered_results = _filter_searxng_results(
                 raw_results, disambiguated_query, k
             )
-            # 额外过滤低质量结果
             filtered_results = _filter_low_quality_results(filtered_results, query)
+            print(
+                f"[Search] Got {len(raw_results)} raw results from SearXNG, {len(filtered_results)} after filtering"
+            )
             return _filter_search_results(filtered_results)
+        else:
+            print(
+                f"[SearXNG] Non-200 status: {resp.status_code}, body: {resp.text[:200]}"
+            )
         return []
     except Exception as e:
         print(f"[Search] SearXNG failed: {e}")
@@ -1939,51 +2255,53 @@ def _safe_search_ddgs(query: str, k: int) -> List[Dict]:
     """封装 DuckDuckGo - 使用直接HTTP请求以支持代理"""
     if not _DDGS_AVAILABLE:
         return []
-    
+
     # 获取代理配置
-    proxy = os.getenv("DDGS_PROXY") or os.getenv("http_proxy") or os.getenv("HTTP_PROXY")
-    
+    proxy = (
+        os.getenv("DDGS_PROXY") or os.getenv("http_proxy") or os.getenv("HTTP_PROXY")
+    )
+
     try:
         results = []
         is_chinese = any("\u4e00" <= ch <= "\u9fff" for ch in query)
-        
+
         # 构建 DuckDuckGo HTML 搜索 URL
         encoded_query = urllib.parse.quote(query)
         url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
-        
+
         # 设置请求头
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.5",
         }
-        
+
         # 设置代理
         proxies = None
         if proxy:
             proxies = {"http": proxy, "https": proxy}
             print(f"[Search] Using proxy for DuckDuckGo: {proxy}")
-        
+
         # 发送请求
         resp = _GLOBAL_SESSION.get(url, headers=headers, proxies=proxies, timeout=8)
-        
+
         if resp.status_code != 200:
             print(f"[Search] DuckDuckGo returned status {resp.status_code}")
             return []
-        
+
         # 解析HTML
         soup = BeautifulSoup(resp.text, "html.parser")
-        
+
         # 查找搜索结果
         result_links = soup.select("a.result__a")
-        
+
         for i, link in enumerate(result_links):
             if i >= k:
                 break
-            
+
             title = link.get_text(strip=True)
             href = link.get("href", "")
-            
+
             # 解析 DuckDuckGo 跳转 URL
             final_url = href
             if "uddg=" in href:
@@ -1995,7 +2313,7 @@ def _safe_search_ddgs(query: str, k: int) -> List[Dict]:
                         final_url = urllib.parse.unquote(query_params["uddg"][0])
                 except Exception:
                     pass
-            
+
             # 获取摘要 - 查找相邻元素
             snippet = ""
             # 尝试多种方式获取snippet
@@ -2006,23 +2324,25 @@ def _safe_search_ddgs(query: str, k: int) -> List[Dict]:
                     snippet_elem = result_div.select_one("div.result__snippet")
                 if snippet_elem:
                     snippet = snippet_elem.get_text(strip=True)
-            
+
             if title and final_url:
-                results.append({
-                    "title": title,
-                    "summary": snippet,
-                    "url": final_url,
-                    "source": "ddgs",
-                    "score": 0.9 - (i * 0.1),
-                })
-        
+                results.append(
+                    {
+                        "title": title,
+                        "summary": snippet,
+                        "url": final_url,
+                        "source": "ddgs",
+                        "score": 0.9 - (i * 0.1),
+                    }
+                )
+
         if results:
             print(f"[Search] Got {len(results)} results from DuckDuckGo (direct HTTP)")
             return _filter_search_results(results)
-        
+
         print("[Search] DuckDuckGo returned no results")
         return []
-        
+
     except Exception as e:
         print(f"[Search] DDGS failed: {e}")
         return []
@@ -2081,7 +2401,7 @@ def web_search(query: str, top_k: int = 8) -> str:
 
         # 1. Optimize Query
         optimized_q = _optimize_search_query(query)
-        
+
         # 1.5. 对实体类查询添加 Wikipedia 限定（仅对Serper英文搜索有效）
         if _is_entity_query(query) and "site:" not in optimized_q.lower():
             # 检测查询语言，选择合适的 Wikipedia 站点
@@ -2089,8 +2409,10 @@ def web_search(query: str, top_k: int = 8) -> str:
             is_chinese_query = any("\u4e00" <= ch <= "\u9fff" for ch in query[:50])
             if not is_chinese_query:
                 optimized_q = f"{optimized_q} site:wikipedia.org"
-                print(f"[Monitoring] Entity query detected, added Wikipedia site限定: {optimized_q[:80]}...")
-        
+                print(
+                    f"[Monitoring] Entity query detected, added Wikipedia site限定: {optimized_q[:80]}..."
+                )
+
         is_chinese = any("\u4e00" <= ch <= "\u9fff" for ch in optimized_q)
 
         # 2. Define Tasks based on query language
@@ -2100,47 +2422,57 @@ def web_search(query: str, top_k: int = 8) -> str:
         tasks = []
 
         if is_chinese:
-            # Chinese query: parallel multi-source search
-            print(f"[Search] Chinese query detected, using parallel multi-source search")
-            
-            # Task: Bocha API (if available)
+            # Chinese query: SearXNG + Baidu + 360 parallel
+            print(
+                f"[Search] Chinese query detected, using SearXNG + Baidu + 360 parallel"
+            )
+
+            # Task: SearXNG (priority)
+            if searxng_base_url:
+                tasks.append(
+                    lambda: _safe_search_searxng(optimized_q, top_k, searxng_base_url)
+                )
+
+            # Task: Baidu direct (backup)
+            tasks.append(lambda: _safe_search_baidu_direct(optimized_q, top_k))
+
+            # Task: 360 search (backup)
+            tasks.append(lambda: _safe_search_360(optimized_q, top_k))
+
+            # Task: Bocha API (backup)
             if _BOCHA_AVAILABLE:
                 tasks.append(lambda: _safe_search_bocha(optimized_q, top_k))
-            
-            # Task: Baidu direct (web scraping)
-            tasks.append(lambda: _safe_search_baidu_direct(optimized_q, top_k))
-            
-            # Task: 360 search
-            tasks.append(lambda: _safe_search_360(optimized_q, top_k))
-            
-            # Task: Sogou search
+
+            # Task: Sogou search (backup)
             tasks.append(lambda: _safe_search_sogou(optimized_q, top_k))
-            
-            # Task: Toutiao search
+
+            # Task: Toutiao search (backup)
             tasks.append(lambda: _safe_search_toutiao(optimized_q, top_k))
-            
-            # Task: Serper (for Chinese results)
+
+            # Task: Serper (backup)
             if serper_key:
-                tasks.append(lambda: _safe_search_serper(optimized_q, top_k, serper_key))
-            
-            # Task: SearXNG (backup)
-            if searxng_base_url:
-                tasks.append(lambda: _safe_search_searxng(optimized_q, top_k, searxng_base_url))
+                tasks.append(
+                    lambda: _safe_search_serper(optimized_q, top_k, serper_key)
+                )
         else:
-            # Non-Chinese query: parallel multi-source search
-            print(f"[Search] Non-Chinese query, using parallel multi-source search")
-            
-            # Task: Serper
+            # Non-Chinese query: SearXNG priority with parallel backup
+            print(f"[Search] Non-Chinese query, using SearXNG priority with parallel")
+
+            # Task: SearXNG (priority)
+            if searxng_base_url:
+                tasks.append(
+                    lambda: _safe_search_searxng(optimized_q, top_k, searxng_base_url)
+                )
+
+            # Task: Serper (parallel)
             if serper_key:
-                tasks.append(lambda: _safe_search_serper(optimized_q, top_k, serper_key))
-            
-            # Task: DuckDuckGo
+                tasks.append(
+                    lambda: _safe_search_serper(optimized_q, top_k, serper_key)
+                )
+
+            # Task: DuckDuckGo (parallel)
             if _DDGS_AVAILABLE:
                 tasks.append(lambda: _safe_search_ddgs(optimized_q, top_k))
-            
-            # Task: SearXNG
-            if searxng_base_url:
-                tasks.append(lambda: _safe_search_searxng(optimized_q, top_k, searxng_base_url))
 
         # 3. Parallel Execution
         all_results = []
@@ -2519,7 +2851,9 @@ def _fetch_local_trafilatura(url: str, timeout: int = 5) -> Optional[str]:
 
 def web_fetch(url: str, max_bytes: int = 200_000, force_refresh: bool = False) -> str:
     try:
-        print(f"[Monitoring] web_fetch called with url='{url}', force_refresh={force_refresh}")
+        print(
+            f"[Monitoring] web_fetch called with url='{url}', force_refresh={force_refresh}"
+        )
 
         # URL去重检测
         normalized_url = _normalize_url(url)
@@ -2633,8 +2967,10 @@ def web_fetch(url: str, max_bytes: int = 200_000, force_refresh: bool = False) -
 
             if content_result:
                 # 压缩内容：从15000字符减少到5000字符
-                compressed_content = _compress_fetched_content(content_result, max_length=5000)
-                
+                compressed_content = _compress_fetched_content(
+                    content_result, max_length=5000
+                )
+
                 # 缓存
                 try:
                     result = json.dumps(
@@ -2946,7 +3282,9 @@ def web_fetch(url: str, max_bytes: int = 200_000, force_refresh: bool = False) -
             pass
 
 
-def browse_page(url: str, instructions: str, max_bytes: int = 150_000, force_refresh: bool = False) -> str:
+def browse_page(
+    url: str, instructions: str, max_bytes: int = 150_000, force_refresh: bool = False
+) -> str:
     try:
         print(
             f"[Monitoring] browse_page url='{url}' instructions='{str(instructions)[:80]}' force_refresh={force_refresh}"

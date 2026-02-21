@@ -1,0 +1,23 @@
+general:
+  debug: false
+  instance_name: "SearXNG"
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: ""
+  formats:
+    - html
+  default_doi_resolver: "doi.org"
+
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  base_url: 'http://localhost:8083/'
+  limiter: false
+  public_instance: false
+  secret_key: "test_secret_key"
+
+ui:
+  default_theme: simple
+  default_locale: ""

@@ -1,0 +1,33 @@
+general:
+  debug: false
+  instance_name: 'SearXNG for Research Agent'
+  enable_metrics: false
+
+search:
+  safe_search: 0
+  default_lang: 'auto'
+  max_page: 0
+  default_categories: ['general']
+
+server:
+  base_url: 'http://localhost:8083/'
+  port: 8080
+  bind_address: '0.0.0.0'
+  secret_key: 'make_a_secure_random_string_here'
+  limiter: false
+  public_instance: false
+
+outgoing:
+  request_timeout: 2.0
+  max_request_timeout: 10.0
+
+enabled_plugins:
+  - 'self_info'
+
+engines:
+  - name: duckduckgo
+    enabled: true
+    shortcut: d
+    timeout: 2.0
+    weight: 1
+    categories: [general, web]

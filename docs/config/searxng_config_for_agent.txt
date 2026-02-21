@@ -1,0 +1,14 @@
+# SearXNG Instance Configuration for Research Agent
+
+# Set the SearXNG base URL to use our local instance
+SEARXNG_BASE_URL=http://localhost:8083/
+
+# You can add this to your .env file or set it as an environment variable
+# For Windows Command Prompt:
+# set SEARXNG_BASE_URL=http://localhost:8083/
+
+# For PowerShell:
+# $env:SEARXNG_BASE_URL = "http://localhost:8083/"
+
+# The SearXNG instance is now running and ready to use with the Research Agent
+# It is configured for private use with limiter disabled
