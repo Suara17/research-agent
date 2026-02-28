@@ -186,6 +186,9 @@ class QueryResponse(BaseModel):
 async def query(req: QueryRequest) -> QueryResponse:
     verify_token()  # 验证token
     max_steps = 40  # 40步（约10分钟）
+    
+    # 整体超时设置：留20秒给答案综合
+    TOTAL_TIMEOUT = 580  # 秒
 
     # Define a helper to run a single agent instance
     async def run_single_agent(agent_id: int):
@@ -197,27 +200,34 @@ async def query(req: QueryRequest) -> QueryResponse:
 
         # Add a system hint to differentiate them slightly (optional, but good for diversity)
         # For now, we rely on temperature randomness
+        
+        async def _run_agent_loop():
+            async for chunk in agent_loop(
+                messages,
+                [
+                    web_search,
+                    web_fetch,
+                    browse_page,
+                    x_keyword_search,
+                    search_pdf_attachment,
+                    browse_pdf_attachment,
+                    get_weather,
+                ],
+                max_steps=max_steps,
+            ):
+                if chunk.type == "text" and chunk.content:
+                    trace_chunks.append(chunk.content)
+            
+            full_trace = "".join(trace_chunks)
+            return {"id": agent_id, "trace": full_trace, "answer": ""}
 
-        async for chunk in agent_loop(
-            messages,
-            [
-                web_search,
-                web_fetch,
-                browse_page,
-                x_keyword_search,
-                search_pdf_attachment,
-                browse_pdf_attachment,
-                get_weather,
-            ],
-            max_steps=max_steps,
-        ):
-            if chunk.type == "text" and chunk.content:
-                trace_chunks.append(chunk.content)
-
-        full_trace = "".join(trace_chunks)
-
-        # 不在这里处理答案，让synthesize_best_answer统一处理
-        return {"id": agent_id, "trace": full_trace, "answer": ""}
+        try:
+            # 使用 asyncio.wait_for 强制整体超时
+            return await asyncio.wait_for(_run_agent_loop(), timeout=TOTAL_TIMEOUT)
+        except asyncio.TimeoutError:
+            print(f"[Agent {agent_id}] Total timeout ({TOTAL_TIMEOUT}s) exceeded, returning partial result")
+            full_trace = "".join(trace_chunks)
+            return {"id": agent_id, "trace": full_trace, "answer": ""}
 
     # Determine number of agents to run in parallel
     num_agents = int(

@@ -8,6 +8,8 @@ from urllib.parse import urlparse
 from typing import Optional, Dict, Any
 from curl_cffi import requests
 
+from .config import TimeoutConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -71,12 +73,12 @@ class DomainStatus:
             'www.wikidata.org', 'api.wikipedia.org',
         }
         if domain in fast_domains:
-            return 3
+            return TimeoutConfig.SMART_FAST_DOMAIN
 
-        # 首次尝试：3秒快速失败
-        # 后续尝试：逐渐增加，最多8秒
-        base_timeout = 3
-        return min(base_timeout + attempt * 2, 8)
+        # 首次尝试：使用配置的基础超时
+        # 后续尝试：逐渐增加，最多到最大超时
+        base_timeout = TimeoutConfig.SMART_FIRST_ATTEMPT
+        return min(base_timeout + attempt * 2, TimeoutConfig.SMART_MAX_TIMEOUT)
 
 
 class ErrorClassifier:

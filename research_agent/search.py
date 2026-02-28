@@ -103,6 +103,7 @@ except ImportError:
 
 from .utils import get_session, get_llm_client, clean_answer
 from .intelligent_fetcher import get_intelligent_fetcher
+from .config import TimeoutConfig
 
 # search_optimizer 模块已移除 - 功能未实际使用
 
@@ -117,17 +118,57 @@ _GLOBAL_SESSION.headers.update(
     }
 )
 
+# --- SearXNG 失败计数器（连续失败3次后临时跳过，避免每次等待超时）---
+class _SearXNGCircuitBreaker:
+    """SearXNG 熔断器：连续失败N次后临时跳过，一段时间后自动恢复"""
+    FAILURE_THRESHOLD = 3       # 连续失败阈值
+    RECOVERY_SECONDS = 120      # 熔断后恢复等待时间（秒）
+
+    def __init__(self):
+        self._consecutive_failures = 0
+        self._tripped_at: float = 0.0   # 熔断触发时间戳
+
+    def is_open(self) -> bool:
+        """返回 True 表示熔断器打开（应跳过 SearXNG）"""
+        if self._consecutive_failures < self.FAILURE_THRESHOLD:
+            return False
+        elapsed = time.time() - self._tripped_at
+        if elapsed >= self.RECOVERY_SECONDS:
+            # 恢复：重置计数，允许重试
+            self._consecutive_failures = 0
+            print(f"[SearXNG] Circuit breaker reset after {elapsed:.0f}s, retrying")
+            return False
+        return True
+
+    def record_failure(self):
+        self._consecutive_failures += 1
+        if self._consecutive_failures == self.FAILURE_THRESHOLD:
+            self._tripped_at = time.time()
+            print(
+                f"[SearXNG] Circuit breaker TRIPPED after {self.FAILURE_THRESHOLD} "
+                f"consecutive failures, skipping for {self.RECOVERY_SECONDS}s"
+            )
+
+    def record_success(self):
+        if self._consecutive_failures > 0:
+            print(f"[SearXNG] Circuit breaker reset (success)")
+        self._consecutive_failures = 0
+
+
+_SEARXNG_CB = _SearXNGCircuitBreaker()
+
 # --- SearXNG 引擎组合配置 ---
 # 根据查询类型推荐不同的搜索引擎组合
+# 注意: google, duckduckgo 在服务器IP被封禁，使用代理后仍可能受限
 SEARXNG_ENGINE_PRESETS = {
-    "general": "bing,duckduckgo,google",
-    "academic": "arxiv,google scholar,pubmed,semantic scholar",
-    "code": "github,askubuntu,superuser",
+    "general": "bing,wikipedia,github",
+    "academic": "arxiv,wikipedia,pubmed",
+    "code": "github,wikipedia",
     "video": "youtube,peertube,vimeo",
-    "images": "bing images,google images",
-    "news": "bing news,google news",
-    "it": "github,askubuntu,superuser,stackexchange",
-    "science": "arxiv,google scholar,pubmed,crossref",
+    "images": "bing images",
+    "news": "bing news",
+    "it": "github,wikipedia",
+    "science": "arxiv,wikipedia,pubmed",
 }
 
 # 查询类型关键词映射
@@ -383,7 +424,7 @@ def _fetch_with_curl_cffi(url: str) -> Optional[str]:
     """
     try:
         # Impersonate Chrome to bypass basic WAF/403
-        r = requests.get(url, impersonate="chrome120", timeout=5)
+        r = requests.get(url, impersonate="chrome120", timeout=TimeoutConfig.FETCH_LIGHTWEIGHT)
         if r.status_code == 200:
             # Use Trafilatura to extract content from HTML
             if _TRAFILATURA_AVAILABLE:
@@ -409,7 +450,7 @@ def _fetch_with_drission_session(url: str) -> Optional[str]:
         return None
     try:
         page = SessionPage()
-        page.get(url, timeout=5)
+        page.get(url, timeout=TimeoutConfig.FETCH_LIGHTWEIGHT)
 
         # Try extracting body text directly
         text = page.ele("tag:body").text
@@ -494,7 +535,7 @@ def _fetch_with_drission(url: str) -> Optional[str]:
         page = ChromiumPage(addr_or_opts=co)
 
         # Set timeout (reduced from 15s to 8s)
-        page.get(url, timeout=8)
+        page.get(url, timeout=TimeoutConfig.FETCH_BROWSER)
 
         # Wait slightly for JS to settle (optional, but good for heavy sites)
         # page.wait.load_start()
@@ -582,8 +623,8 @@ def _fetch_with_jina(url: str, session) -> Optional[str]:
         # Jina 建议的 Headers
         headers = {"X-Return-Format": "markdown"}
 
-        # 8秒超时，避免阻塞太久
-        resp = session.get(jina_url, headers=headers, timeout=8)
+        # 使用统一超时配置
+        resp = session.get(jina_url, headers=headers, timeout=TimeoutConfig.FETCH_JINA)
 
         if resp.status_code == 200:
             text = resp.text
@@ -727,22 +768,63 @@ _LOW_QUALITY_DOMAINS = {
     "wikipedia",  # 维基百科放最后，不一定低质量
 }
 
-# 高质量域名
+# 高质量域名 - 按领域分类扩展
 _HIGH_QUALITY_DOMAINS = {
+    # === 学术期刊/出版商 ===
     "arxiv.org",
-    "pubmed.org",
-    "nih.gov",
-    "edu",
-    "gov",
-    "jstor.org",
     "springer.com",
+    "nature.com",
+    "cell.com",
+    "sciencedirect.com",
     "elsevier.com",
     "wiley.com",
     "sagepub.com",
+    "tandfonline.com",
+    "oxfordacademic.com",
+    "cambridge.org",
+    "frontiersin.org",
+    "mdpi.com",
+    "plos.org",
+    "iop.org",
+    "acs.org",
+    # === 生物学/医学 ===
+    "ncbi.nlm.nih.gov",
+    "pubmed.org",
+    "nih.gov",
+    "biogrid.org",
+    "uniprot.org",
+    "string-db.org",
+    "biorxiv.org",
+    "medrxiv.org",
+    "genecards.org",
+    "proteinatlas.org",
+    # === 天文学/航天 ===
+    "nasa.gov",
+    "esa.int",
+    "iau.org",
+    "aanda.org",
+    # === 历史/考古/人文 ===
+    "jstor.org",
+    "academia.edu",
+    "researchgate.net",
+    "britannica.com",
+    "encyclopedia.com",
+    # === 科技/计算机 ===
+    "ieee.org",
+    "acm.org",
+    "dl.acm.org",
+    "stackoverflow.com",
+    "github.com",
+    # === 政府/教育 ===
+    "edu",
+    "gov",
+    "org",
+    # === 地理/环境 ===
+    "nationalgeographic.com",
+    # === 艺术建筑 ===
     "architecture.org",
     "archdaily.com",
     "dezeen.com",
-    "archdaily.com",
 }
 
 
@@ -792,12 +874,48 @@ def _disambiguate_entities(query: str) -> str:
     return result
 
 
+def _is_academic_query(query: str) -> bool:
+    """检测是否为学术/科学类查询"""
+    query_lower = query.lower()
+    # 学术查询特征：蛋白质名、基因名、物种名、学术关键词
+    academic_indicators = [
+        # 生物学
+        "protein", "gene", "interact", "arabidopsis", "mutant", "genome",
+        "enzyme", "receptor", "pathway", "expression", "transcription",
+        "amino acid", "cell", "membrane", "nucleus", "dna", "rna",
+        # 化学物理
+        "molecule", "compound", "reaction", "crystal", "spectrum",
+        # 天文学
+        "star", "planet", "asteroid", "comet", "galaxy", "telescope",
+        "orbit", "meteor", "satellite",
+        # 学术通用
+        "study", "research", "paper", "journal", "publication",
+        "hypothesis", "theory", "experiment", "analysis",
+        # 特定模式：大写字母+数字（如蛋白质名SAG101, HR4）
+    ]
+    
+    # 检查是否包含学术关键词
+    if any(ind in query_lower for ind in academic_indicators):
+        return True
+    
+    # 检查是否包含蛋白质/基因命名模式（如SAG101, ADF3, PAD4）
+    import re
+    if re.search(r'\b[A-Z]{2,4}\d+\b', query):  # 如SAG101, HR4
+        return True
+    if re.search(r'\b[A-Z]{2,4}\d*[a-z]?\b', query):  # 如EDS1, PAD4
+        return True
+    
+    return False
+
+
 def _filter_low_quality_results(results: List[Dict], original_query: str) -> List[Dict]:
     """
     过滤低质量搜索结果：
     1. 词典定义（标题为单个词或极短）
     2. 商业公司网站（非目标内容）
     3. 与查询无关的结果
+    
+    对于学术/科学类查询，放宽关键词匹配要求，优先信任高质量学术域名
     """
     if not results:
         return []
@@ -824,8 +942,16 @@ def _filter_low_quality_results(results: List[Dict], original_query: str) -> Lis
         "and",
         "or",
         "but",
+        "with",
+        "that",
+        "this",
+        "which",
+        "from",
     }
     query_keywords = query_keywords - stop_words
+    
+    # 检测是否为学术查询
+    is_academic = _is_academic_query(original_query)
 
     for r in results:
         title = str(r.get("title") or "")
@@ -833,6 +959,20 @@ def _filter_low_quality_results(results: List[Dict], original_query: str) -> Lis
         url = str(r.get("url") or "")
 
         title_lower = title.lower()
+        
+        # 对于高质量学术域名，直接通过（除非明显无关）
+        is_high_quality = _is_high_quality_url(url)
+        if is_high_quality and is_academic:
+            # 学术查询 + 高质量域名 = 信任该结果，仅检查明显无关内容
+            content_check = f"{title_lower} {summary.lower()}"
+            irrelevant_patterns = [
+                "玄幻", "修仙", "小说", "txt", "全集",
+                "pornhub", "xvideos", "xhamster",
+                "buy cheap", "for sale", "discount",
+            ]
+            if not any(pattern in content_check for pattern in irrelevant_patterns):
+                filtered.append(r)
+                continue
 
         # 1. 过滤词典定义（标题极短且像单词）
         if len(title) <= 20 and " " not in title.strip():
@@ -844,7 +984,7 @@ def _filter_low_quality_results(results: List[Dict], original_query: str) -> Lis
                 continue
             # 允许包含数字或明确实体的标题
             if not any(c.isdigit() for c in title) and not any(
-                kw in title_lower for kw in ["hotel", "building", "architect", "book"]
+                kw in title_lower for kw in ["hotel", "building", "architect", "book", "gene", "protein"]
             ):
                 continue
 
@@ -863,9 +1003,13 @@ def _filter_low_quality_results(results: List[Dict], original_query: str) -> Lis
             ),
             ("music app", "music" in title_lower and "app" in title_lower),
         ]
+        skip_result = False
         for pattern, condition in irrelevant_companies:
             if condition:
-                continue
+                skip_result = True
+                break
+        if skip_result:
+            continue
 
         # 3. 过滤中文玄幻小说等无关内容
         irrelevant_patterns = [
@@ -882,8 +1026,8 @@ def _filter_low_quality_results(results: List[Dict], original_query: str) -> Lis
         if any(pattern in content_check for pattern in irrelevant_patterns):
             continue
 
-        # 4. 检查与查询的相关性（至少有一个关键词匹配）
-        # 对于包含明确实体的查询，放宽要求
+        # 4. 检查与查询的相关性
+        # 对于学术查询或高质量域名，放宽关键词匹配要求
         content_for_match = f"{title_lower} {summary.lower()}"
         has_keyword_match = (
             any(kw in content_for_match for kw in query_keywords)
@@ -891,16 +1035,9 @@ def _filter_low_quality_results(results: List[Dict], original_query: str) -> Lis
             else True
         )
 
-        # 5. 对URL进行检查
-        url_lower = url.lower()
-
-        # 如果以上检查都通过，添加结果
-        if has_keyword_match or _is_high_quality_url(url):
+        # 对于高质量域名，即使关键词匹配不强也保留
+        if has_keyword_match or is_high_quality:
             filtered.append(r)
-        else:
-            # 对于高质量域名，即使关键词匹配不强也保留
-            if _is_high_quality_url(url):
-                filtered.append(r)
 
     return filtered
 
@@ -1254,12 +1391,187 @@ def _translate_query(query: str, target_lang: str = "English") -> str:
         return query
 
 
+def _detect_query_domain_and_languages(query: str) -> dict:
+    """智能检测查询领域并推荐搜索语言
+    
+    根据查询内容分析涉及的领域和地理区域，推荐最优搜索语言组合
+    
+    Returns:
+        dict: {
+            "primary_language": "zh" | "en" | "de" | "fr" | "ja" | ...,
+            "recommended_languages": ["en", "zh", ...],
+            "domain": "china" | "science" | "europe_architecture" | ...,
+            "reason": "检测理由"
+        }
+    """
+    query_lower = query.lower()
+    
+    # 中文检测
+    has_chinese = any("\u4e00" <= ch <= "\u9fff" for ch in query)
+    
+    # 日文检测（平假名、片假名）
+    has_japanese = any("\u3040" <= ch <= "\u309f" or "\u30a0" <= ch <= "\u30ff" for ch in query)
+    
+    # 韩文检测
+    has_korean = any("\uac00" <= ch <= "\ud7af" for ch in query)
+    
+    # 领域关键词检测
+    domain_keywords = {
+        "china": [
+            "中国", "中国历史", "中国人", "中文", "北京", "上海", "深圳", "广州", "杭州", 
+            "腾讯", "阿里", "华为", "百度", "小米", "中国航天", "中国科技",
+            "chinese", "china", "beijing", "shanghai", "shenzhen", "tencent", "alibaba", "huawei"
+        ],
+        "japan_korea": [
+            "日本", "韩国", "动漫", "游戏", "任天堂", "索尼", "东京", "首尔",
+            "japan", "japanese", "korea", "korean", "tokyo", "seoul", "nintendo", "sony", "anime", "manga"
+        ],
+        "science_biology": [
+            "蛋白质", "基因", "拟南芥", "arabidopsis", "protein", "gene", "genome", 
+            "分子", "细胞", "protein interaction", "pad4", "interactor"
+        ],
+        "europe_architecture": [
+            "architect", "architecture", "building", "skyscraper", "hotel",
+            "german", "germany", "austrian", "austria", "bauhaus", "modernism",
+            "french", "france", "paris", "瑞士", "swiss", "finnish", "finland",
+            "建筑师", "建筑", "德国", "法国", "芬兰", "奥地利", "欧洲"
+        ],
+        "europe_french": [
+            "french", "france", "paris", "french astronomer", "comet", 
+            "法国", "巴黎", "法国天文学家", "彗星"
+        ],
+        "russia": [
+            "russian", "russia", "moscow", "soviet", "ussr",
+            "俄国", "俄罗斯", "苏联", "莫斯科"
+        ],
+        "international": [
+            "olympics", "nobel", "united nations", "world cup", "international",
+            "奥运", "诺贝尔", "联合国", "世界杯", "国际"
+        ]
+    }
+    
+    # 检测匹配的领域
+    detected_domains = []
+    for domain, keywords in domain_keywords.items():
+        for kw in keywords:
+            if kw in query_lower:
+                detected_domains.append(domain)
+                break
+    
+    # 根据检测结果推荐语言
+    if "china" in detected_domains:
+        return {
+            "primary_language": "zh",
+            "recommended_languages": ["zh", "en"],
+            "domain": "china",
+            "reason": "检测到中国相关内容，优先中文搜索"
+        }
+    
+    if "japan_korea" in detected_domains:
+        return {
+            "primary_language": "en",
+            "recommended_languages": ["en", "ja", "zh"],
+            "domain": "japan_korea",
+            "reason": "检测到日韩相关内容，推荐英文为主，辅以日文/中文"
+        }
+    
+    if "science_biology" in detected_domains:
+        return {
+            "primary_language": "en",
+            "recommended_languages": ["en"],
+            "domain": "science_biology",
+            "reason": "检测到生物科学领域，优先英文搜索（学术文献主要为英文）"
+        }
+    
+    if "europe_architecture" in detected_domains:
+        return {
+            "primary_language": "en",
+            "recommended_languages": ["en", "de"],
+            "domain": "europe_architecture",
+            "reason": "检测到欧洲建筑相关内容，推荐英文和德文搜索"
+        }
+    
+    if "europe_french" in detected_domains:
+        return {
+            "primary_language": "en",
+            "recommended_languages": ["en", "fr"],
+            "domain": "europe_french",
+            "reason": "检测到法国相关内容，推荐英文和法文搜索"
+        }
+    
+    if "russia" in detected_domains:
+        return {
+            "primary_language": "en",
+            "recommended_languages": ["en"],
+            "domain": "russia",
+            "reason": "检测到俄国相关内容，优先英文搜索"
+        }
+    
+    if "international" in detected_domains:
+        return {
+            "primary_language": "en",
+            "recommended_languages": ["en"],
+            "domain": "international",
+            "reason": "检测到国际组织/赛事，优先英文搜索"
+        }
+    
+    # 默认：根据查询语言判断
+    if has_chinese:
+        return {
+            "primary_language": "zh",
+            "recommended_languages": ["zh", "en"],
+            "domain": "general",
+            "reason": "中文查询，优先中文搜索，辅以英文"
+        }
+    
+    return {
+        "primary_language": "en",
+        "recommended_languages": ["en"],
+        "domain": "general",
+        "reason": "通用查询，优先英文搜索"
+    }
+
+
 def expand_query_language(query: str) -> list:
+    """根据查询领域智能扩展多语言搜索查询
+    
+    返回额外的语言查询变体，用于并行搜索提高覆盖率
+    """
     queries = []
-    if any("\u4e00" <= ch <= "\u9fff" for ch in query):
-        en_q = _translate_query(query, "English")
-        if en_q and en_q.lower() != query.lower():
-            queries.append(en_q)
+    
+    # 检测查询领域和推荐语言
+    lang_info = _detect_query_domain_and_languages(query)
+    recommended_langs = lang_info.get("recommended_languages", ["en"])
+    primary_lang = lang_info.get("primary_language", "en")
+    
+    # 检测原始查询语言
+    has_chinese = any("\u4e00" <= ch <= "\u9fff" for ch in query)
+    
+    # 根据推荐语言生成翻译
+    translation_map = {
+        "en": "English",
+        "zh": "Chinese",
+        "de": "German",
+        "fr": "French",
+        "ja": "Japanese",
+        "ko": "Korean",
+        "ru": "Russian"
+    }
+    
+    for lang in recommended_langs:
+        # 跳过与原始查询语言相同的翻译
+        if lang == "zh" and has_chinese:
+            continue
+        if lang == "en" and not has_chinese and not any(c.isalpha() and ord(c) > 127 for c in query):
+            continue
+            
+        target_lang = translation_map.get(lang, "English")
+        if target_lang:
+            translated_q = _translate_query(query, target_lang)
+            if translated_q and translated_q.lower() != query.lower():
+                queries.append(translated_q)
+                print(f"[Search] Language expansion: {lang} -> {translated_q[:50]}...")
+    
     return queries
 
 
@@ -1411,7 +1723,7 @@ def _fetch_wikipedia_from_host(host: str, title: str) -> Optional[dict]:
         # 尝试 REST API
         api = f"https://{host}/api/rest_v1/page/summary/{urllib.parse.quote(title)}"
         req = urllib.request.Request(api, headers={"User-Agent": _WIKI_UA})
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=TimeoutConfig.WIKI_API) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace"))
         extract = str(data.get("extract") or "")
         if extract:
@@ -1429,7 +1741,7 @@ def _fetch_wikipedia_from_host(host: str, title: str) -> Optional[dict]:
         # 尝试 PHP API
         api_php = f"https://{host}/w/api.php?action=query&format=json&prop=extracts&titles={urllib.parse.quote(title)}&exintro=1&explaintext=1"
         req = urllib.request.Request(api_php, headers={"User-Agent": _WIKI_UA})
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=TimeoutConfig.WIKI_API) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace"))
         pages = data.get("query", {}).get("pages", {})
         for pid, pdata in pages.items():
@@ -1463,7 +1775,7 @@ def _fetch_reprap_mediawiki(url: str) -> Optional[dict]:
             return None
         api = f"https://{host}/mediawiki/api.php?action=parse&page={urllib.parse.quote(title)}&prop=text&format=json"
         req = urllib.request.Request(api, headers={"User-Agent": _pick_ua(1)})
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=TimeoutConfig.FETCH_LIGHTWEIGHT) as resp:
             j = json.loads(resp.read().decode("utf-8", "replace"))
         parse = j.get("parse") or {}
         text_html = (parse.get("text") or {}).get("*") or ""
@@ -1547,7 +1859,7 @@ def _safe_search_bocha(query: str, k: int) -> List[Dict]:
             method="POST",
         )
 
-        with urllib.request.urlopen(req, timeout=30, context=ssl_context) as response:
+        with urllib.request.urlopen(req, timeout=TimeoutConfig.SEARCH_PRIMARY, context=ssl_context) as response:
             result = response.read().decode("utf-8")
             data = json.loads(result)
 
@@ -1587,7 +1899,7 @@ def _resolve_360_redirect(url: str, session) -> str:
 
     try:
         # 使用HEAD请求快速获取跳转目标
-        resp = session.head(url, allow_redirects=True, timeout=5)
+        resp = session.head(url, allow_redirects=True, timeout=TimeoutConfig.REDIRECT_RESOLVE)
         if resp.url and resp.url != url:
             return resp.url
     except Exception as e:
@@ -1629,7 +1941,7 @@ def _safe_search_360(query: str, k: int) -> List[Dict]:
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
 
-        resp = _GLOBAL_SESSION.get(url, params=params, headers=headers, timeout=8)
+        resp = _GLOBAL_SESSION.get(url, params=params, headers=headers, timeout=TimeoutConfig.SEARCH_BACKUP)
 
         if resp.status_code != 200:
             print(f"[Search] 360 search failed with status: {resp.status_code}")
@@ -1710,7 +2022,7 @@ def _safe_search_sogou(query: str, k: int) -> List[Dict]:
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
 
-        resp = _GLOBAL_SESSION.get(url, params=params, headers=headers, timeout=8)
+        resp = _GLOBAL_SESSION.get(url, params=params, headers=headers, timeout=TimeoutConfig.SEARCH_BACKUP)
 
         if resp.status_code != 200:
             print(f"[Search] Sogou search failed with status: {resp.status_code}")
@@ -1781,7 +2093,7 @@ def _resolve_baidu_redirect(url: str, session) -> str:
 
     try:
         # 使用HEAD请求快速获取跳转目标
-        resp = session.head(url, allow_redirects=True, timeout=5)
+        resp = session.head(url, allow_redirects=True, timeout=TimeoutConfig.REDIRECT_RESOLVE)
         if resp.url and resp.url != url:
             return resp.url
     except Exception as e:
@@ -1825,7 +2137,7 @@ def _safe_search_baidu_direct(query: str, k: int) -> List[Dict]:
         }
 
         resp = _GLOBAL_SESSION.get(
-            search_url, params=params, headers=headers, timeout=8
+            search_url, params=params, headers=headers, timeout=TimeoutConfig.SEARCH_BACKUP
         )
 
         if resp.status_code != 200:
@@ -1906,7 +2218,7 @@ def _safe_search_toutiao(query: str, k: int) -> List[Dict]:
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
 
-        resp = _GLOBAL_SESSION.get(url, params=params, headers=headers, timeout=8)
+        resp = _GLOBAL_SESSION.get(url, params=params, headers=headers, timeout=TimeoutConfig.SEARCH_BACKUP)
 
         if resp.status_code != 200:
             print(f"[Search] Toutiao search failed with status: {resp.status_code}")
@@ -1990,7 +2302,7 @@ def _safe_search_serper(
         try:
             headers = {"X-API-KEY": key, "Content-Type": "application/json"}
             # Use Global Session for reuse
-            resp = _GLOBAL_SESSION.post(url, headers=headers, data=payload, timeout=8)
+            resp = _GLOBAL_SESSION.post(url, headers=headers, data=payload, timeout=TimeoutConfig.SEARCH_BACKUP)
 
             if resp.status_code == 200:
                 data = resp.json()
@@ -2084,9 +2396,9 @@ def _safe_search_searxng(
         }
 
         # Use Global Session with custom headers
-        # 增加超时时间以适应代理环境
+        # 使用统一超时配置
         resp = _GLOBAL_SESSION.get(
-            searxng_url, params=params, headers=headers, timeout=30
+            searxng_url, params=params, headers=headers, timeout=TimeoutConfig.SEARCH_PRIMARY
         )
         print(f"[SearXNG] Response status: {resp.status_code}")
         if resp.status_code == 200:
@@ -2129,14 +2441,17 @@ def _safe_search_searxng(
             print(
                 f"[Search] Got {len(raw_results)} raw results from SearXNG, {len(filtered_results)} after filtering"
             )
+            _SEARXNG_CB.record_success()
             return _filter_search_results(filtered_results)
         else:
             print(
                 f"[SearXNG] Non-200 status: {resp.status_code}, body: {resp.text[:200]}"
             )
+            _SEARXNG_CB.record_failure()
         return []
     except Exception as e:
         print(f"[Search] SearXNG failed: {e}")
+        _SEARXNG_CB.record_failure()
         return []
 
 
@@ -2165,20 +2480,33 @@ def _calculate_result_score(result: Dict[str, Any], query: str) -> float:
     # 3. 引擎可信度评分
     engine = result.get("engine", result.get("source", "unknown")).lower()
     trusted_engines = {
+        # === 百科类 ===
         "wikipedia": 2.0,
         "wikidata": 2.0,
         "wikinews": 2.0,
+        # === 通用搜索 ===
         "google": 1.8,
         "bing": 1.7,
         "duckduckgo": 1.6,
         "brave": 1.5,
         "startpage": 1.5,
+        # === 学术引擎 ===
         "arxiv": 1.8,
-        "pubmed": 1.8,  # 学术引擎
+        "pubmed": 1.8,
+        "scholar": 1.8,
+        "semanticscholar": 1.7,
+        "crossref": 1.6,
+        "base": 1.6,
+        "core": 1.6,
+        # === 技术引擎 ===
         "github": 1.5,
         "stackoverflow": 1.6,
         "askubuntu": 1.6,
-        "superuser": 1.6,  # 技术引擎
+        "superuser": 1.6,
+        # === 科学数据 ===
+        "biogrid": 1.7,
+        "uniprot": 1.7,
+        "ncbi": 1.7,
     }
     score += trusted_engines.get(engine, 0.5)
 
@@ -2192,14 +2520,27 @@ def _calculate_result_score(result: Dict[str, Any], query: str) -> float:
         if any(
             trusted_domain in domain
             for trusted_domain in [
+                # === 百科 ===
                 "wikipedia.org",
                 "wikidata.org",
+                # === 学术 ===
                 "arxiv.org",
+                "nature.com",
+                "cell.com",
+                "sciencedirect.com",
+                "springer.com",
+                "ncbi.nlm.nih.gov",
+                "pubmed",
+                # === 教育/政府 ===
                 "edu",
                 "gov",
                 "org",
+                # === 技术 ===
                 "stackexchange.com",
                 "github.com",
+                # === 科学数据 ===
+                "biogrid.org",
+                "uniprot.org",
             ]
         ):
             score += 1.0
@@ -2283,7 +2624,7 @@ def _safe_search_ddgs(query: str, k: int) -> List[Dict]:
             print(f"[Search] Using proxy for DuckDuckGo: {proxy}")
 
         # 发送请求
-        resp = _GLOBAL_SESSION.get(url, headers=headers, proxies=proxies, timeout=8)
+        resp = _GLOBAL_SESSION.get(url, headers=headers, proxies=proxies, timeout=TimeoutConfig.SEARCH_DDGS)
 
         if resp.status_code != 200:
             print(f"[Search] DuckDuckGo returned status {resp.status_code}")
@@ -2402,6 +2743,10 @@ def web_search(query: str, top_k: int = 8) -> str:
         # 1. Optimize Query
         optimized_q = _optimize_search_query(query)
 
+        # 1.1. 智能语言检测 - 判断查询领域并推荐搜索语言
+        lang_info = _detect_query_domain_and_languages(query)
+        print(f"[Search] Domain detected: {lang_info['domain']}, primary language: {lang_info['primary_language']}, reason: {lang_info['reason']}")
+
         # 1.5. 对实体类查询添加 Wikipedia 限定（仅对Serper英文搜索有效）
         if _is_entity_query(query) and "site:" not in optimized_q.lower():
             # 检测查询语言，选择合适的 Wikipedia 站点
@@ -2419,75 +2764,139 @@ def web_search(query: str, top_k: int = 8) -> str:
         searxng_base_url = os.getenv("SEARXNG_BASE_URL")
         serper_key = os.getenv("SERPER_API_KEY")
 
-        tasks = []
+        all_results = []
+        tasks = []  # 初始化 tasks 变量
+        primary_provider = "unknown"  # 记录主引擎名称
+        MIN_RESULTS_THRESHOLD = max(3, top_k // 2)  # 最少结果阈值
 
         if is_chinese:
-            # Chinese query: SearXNG + Baidu + 360 parallel
-            print(
-                f"[Search] Chinese query detected, using SearXNG + Baidu + 360 parallel"
-            )
+            # 中文查询: 优先使用博查API
+            print(f"[Search] Chinese query detected, using Bocha API as primary")
 
-            # Task: SearXNG (priority)
-            if searxng_base_url:
-                tasks.append(
-                    lambda: _safe_search_searxng(optimized_q, top_k, searxng_base_url)
-                )
-
-            # Task: Baidu direct (backup)
-            tasks.append(lambda: _safe_search_baidu_direct(optimized_q, top_k))
-
-            # Task: 360 search (backup)
-            tasks.append(lambda: _safe_search_360(optimized_q, top_k))
-
-            # Task: Bocha API (backup)
+            # 优先尝试博查API
             if _BOCHA_AVAILABLE:
-                tasks.append(lambda: _safe_search_bocha(optimized_q, top_k))
+                bocha_results = _safe_search_bocha(optimized_q, top_k)
+                if bocha_results and len(bocha_results) >= MIN_RESULTS_THRESHOLD:
+                    print(f"[Search] Bocha returned {len(bocha_results)} results, using as primary")
+                    all_results = bocha_results
+                    primary_provider = "bocha"
+                else:
+                    print(f"[Search] Bocha returned insufficient results ({len(bocha_results) if bocha_results else 0}), falling back to parallel search")
 
-            # Task: Sogou search (backup)
-            tasks.append(lambda: _safe_search_sogou(optimized_q, top_k))
+            # 如果博查结果不足，使用其他引擎并行
+            if len(all_results) < MIN_RESULTS_THRESHOLD:
+                tasks = []
 
-            # Task: Toutiao search (backup)
-            tasks.append(lambda: _safe_search_toutiao(optimized_q, top_k))
+                # Task: SearXNG - 熔断器打开时跳过，避免等待超时
+                if searxng_base_url and not _SEARXNG_CB.is_open():
+                    tasks.append(
+                        lambda: _safe_search_searxng(optimized_q, top_k, searxng_base_url)
+                    )
+                elif searxng_base_url and _SEARXNG_CB.is_open():
+                    print("[SearXNG] Circuit breaker open, skipping SearXNG this round")
 
-            # Task: Serper (backup)
-            if serper_key:
-                tasks.append(
-                    lambda: _safe_search_serper(optimized_q, top_k, serper_key)
-                )
+                # Task: Baidu direct
+                tasks.append(lambda: _safe_search_baidu_direct(optimized_q, top_k))
+
+                # Task: 360 search
+                tasks.append(lambda: _safe_search_360(optimized_q, top_k))
+
+                # Task: Sogou search
+                tasks.append(lambda: _safe_search_sogou(optimized_q, top_k))
+
+                # Task: Toutiao search
+                tasks.append(lambda: _safe_search_toutiao(optimized_q, top_k))
+
+                # Task: Serper (backup)
+                if serper_key:
+                    tasks.append(
+                        lambda: _safe_search_serper(optimized_q, top_k, serper_key)
+                    )
+
+                # Parallel Execution
+                futures = []
+                for task in tasks:
+                    futures.append(_FETCH_EXECUTOR.submit(task))
+
+                for future in as_completed(futures):
+                    try:
+                        res = future.result()
+                        if res:
+                            all_results.extend(res)
+                    except Exception as e:
+                        print(f"[Search] Worker exception: {e}")
         else:
-            # Non-Chinese query: SearXNG priority with parallel backup
-            print(f"[Search] Non-Chinese query, using SearXNG priority with parallel")
+            # 非中文查询: 优先使用 Serper
+            print(f"[Search] Non-Chinese query, using Serper as primary")
 
-            # Task: SearXNG (priority)
-            if searxng_base_url:
-                tasks.append(
-                    lambda: _safe_search_searxng(optimized_q, top_k, searxng_base_url)
-                )
-
-            # Task: Serper (parallel)
+            # 优先尝试 Serper
             if serper_key:
-                tasks.append(
-                    lambda: _safe_search_serper(optimized_q, top_k, serper_key)
-                )
+                serper_results = _safe_search_serper(optimized_q, top_k, serper_key)
+                if serper_results and len(serper_results) >= MIN_RESULTS_THRESHOLD:
+                    print(f"[Search] Serper returned {len(serper_results)} results, using as primary")
+                    all_results = serper_results
+                    primary_provider = "serper"
+                else:
+                    print(f"[Search] Serper returned insufficient results ({len(serper_results) if serper_results else 0}), falling back to parallel search")
 
-            # Task: DuckDuckGo (parallel)
-            if _DDGS_AVAILABLE:
-                tasks.append(lambda: _safe_search_ddgs(optimized_q, top_k))
+            # 如果 Serper 结果不足，使用其他引擎并行
+            if len(all_results) < MIN_RESULTS_THRESHOLD:
+                tasks = []
 
-        # 3. Parallel Execution
-        all_results = []
-        # Use Global ThreadPool
-        futures = []
-        for task in tasks:
-            futures.append(_FETCH_EXECUTOR.submit(task))
+                # Task: SearXNG - 熔断器打开时跳过，避免等待超时
+                if searxng_base_url and not _SEARXNG_CB.is_open():
+                    tasks.append(
+                        lambda: _safe_search_searxng(optimized_q, top_k, searxng_base_url)
+                    )
+                elif searxng_base_url and _SEARXNG_CB.is_open():
+                    print("[SearXNG] Circuit breaker open, skipping SearXNG this round")
 
-        for future in as_completed(futures):
-            try:
-                res = future.result()
-                if res:
-                    all_results.extend(res)
-            except Exception as e:
-                print(f"[Search] Worker exception: {e}")
+                # Task: DuckDuckGo (parallel) - 已禁用，耗时太长
+                # if _DDGS_AVAILABLE:
+                #     tasks.append(lambda: _safe_search_ddgs(optimized_q, top_k))
+
+                # Parallel Execution
+                futures = []
+                for task in tasks:
+                    futures.append(_FETCH_EXECUTOR.submit(task))
+
+                for future in as_completed(futures):
+                    try:
+                        res = future.result()
+                        if res:
+                            all_results.extend(res)
+                    except Exception as e:
+                        print(f"[Search] Worker exception: {e}")
+
+        # 3. 多语言扩展搜索 - 如果结果不足，尝试其他语言搜索
+        if len(all_results) < MIN_RESULTS_THRESHOLD and len(lang_info.get("recommended_languages", [])) > 1:
+            print(f"[Search] Results insufficient, trying multi-language expansion...")
+            expanded_queries = []
+            
+            # 根据推荐的额外语言生成翻译查询
+            for lang in lang_info["recommended_languages"]:
+                if lang == lang_info["primary_language"]:
+                    continue
+                if lang == "zh" and is_chinese:
+                    continue
+                if lang == "en" and not is_chinese:
+                    continue
+                    
+                # 翻译查询
+                translation_map = {"en": "English", "zh": "Chinese", "de": "German", "fr": "French", "ja": "Japanese"}
+                target_lang = translation_map.get(lang, "English")
+                translated_q = _translate_query(query, target_lang)
+                if translated_q and translated_q.lower() != optimized_q.lower():
+                    expanded_queries.append(translated_q)
+                    print(f"[Search] Multi-lang expansion: {lang} -> {translated_q[:50]}...")
+            
+            # 对扩展查询执行搜索
+            for exp_q in expanded_queries[:2]:  # 最多尝试2个扩展查询
+                if serper_key:
+                    exp_results = _safe_search_serper(exp_q, top_k // 2, serper_key)
+                    if exp_results:
+                        all_results.extend(exp_results)
+                        print(f"[Search] Multi-lang search returned {len(exp_results)} results")
 
         # 4. Result Integration
         if not all_results:
@@ -2523,8 +2932,8 @@ def web_search(query: str, top_k: int = 8) -> str:
             {
                 "source": "mixed_backup",
                 "results": final_results,
-                "providers_used": len(tasks),
-                "primary_provider": "backup_providers",
+                "providers_used": len(tasks) if tasks else 1,
+                "primary_provider": primary_provider,
             },
             ensure_ascii=False,
         )
@@ -2782,7 +3191,7 @@ except ImportError:
                 headers = {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
                 }
-                response = requests.get(url, headers=headers, timeout=5)
+                response = requests.get(url, headers=headers, timeout=TimeoutConfig.FETCH_LIGHTWEIGHT)
                 response.raise_for_status()
 
                 content = extract_content_from_html(response.text, url)
@@ -2834,8 +3243,10 @@ except ImportError:
         return ordered_results
 
 
-def _fetch_local_trafilatura(url: str, timeout: int = 5) -> Optional[str]:
+def _fetch_local_trafilatura(url: str, timeout: int = None) -> Optional[str]:
     """本地快速抓取"""
+    if timeout is None:
+        timeout = TimeoutConfig.FETCH_LIGHTWEIGHT
     if not _TRAFILATURA_AVAILABLE:
         return None
     try:
@@ -2925,7 +3336,7 @@ def web_fetch(url: str, max_bytes: int = 200_000, force_refresh: bool = False) -
             )
 
             # Wait for results (fastest wins)
-            for future in as_completed(futures, timeout=3):
+            for future in as_completed(futures, timeout=TimeoutConfig.FETCH_RACE):
                 try:
                     res = future.result()
                     provider = futures[future]
@@ -3007,7 +3418,7 @@ def web_fetch(url: str, max_bytes: int = 200_000, force_refresh: bool = False) -
 
                 def _download_pdf(u):
                     session = get_session()
-                    r = session.get(u, timeout=8, stream=True, verify=False)
+                    r = session.get(u, timeout=TimeoutConfig.FETCH_HTTP, stream=True, verify=False)
                     r.raise_for_status()
                     buf = b""
                     for chunk in r.iter_content(chunk_size=8192):
@@ -3019,7 +3430,7 @@ def web_fetch(url: str, max_bytes: int = 200_000, force_refresh: bool = False) -
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                     future = executor.submit(_download_pdf, url)
                     try:
-                        content = future.result(timeout=20)
+                        content = future.result(timeout=TimeoutConfig.PDF_PARSE)
                     except concurrent.futures.TimeoutError:
                         print(f"[Warn] PDF download timed out for {url}")
                         raise TimeoutError("PDF download timed out")
@@ -3305,7 +3716,7 @@ def browse_page(
                 "content": f"<input><task>{instructions}</task><title>{title}</title><content>{content[:8000]}</content></input>",
             },
         ]
-        client = get_llm_client(timeout=30.0)
+        client = get_llm_client(timeout=float(TimeoutConfig.LLM_CALL))
         resp = client.chat.completions.create(
             model="qwen3-max",
             stream=False,
@@ -3341,7 +3752,7 @@ def search_pdf_attachment(url: str, query: str, max_pages: int = 6) -> str:
     try:
         ctx = ssl.create_default_context()
         req = urllib.request.Request(url, headers={"User-Agent": _pick_ua(0)})
-        with urllib.request.urlopen(req, context=ctx, timeout=12) as resp:
+        with urllib.request.urlopen(req, context=ctx, timeout=TimeoutConfig.PDF_DOWNLOAD) as resp:
             ctype = resp.headers.get("Content-Type", "").lower()
             data = resp.read(2_000_000)
         if "application/pdf" not in ctype and not url.lower().endswith(".pdf"):
@@ -3390,7 +3801,7 @@ def browse_pdf_attachment(url: str, instructions: str, max_pages: int = 6) -> st
         )
         ctx = ssl.create_default_context()
         req = urllib.request.Request(url, headers={"User-Agent": _pick_ua(1)})
-        with urllib.request.urlopen(req, context=ctx, timeout=12) as resp:
+        with urllib.request.urlopen(req, context=ctx, timeout=TimeoutConfig.PDF_DOWNLOAD) as resp:
             ctype = resp.headers.get("Content-Type", "").lower()
             data = resp.read(2_000_000)
         if "application/pdf" not in ctype and not url.lower().endswith(".pdf"):
@@ -3425,7 +3836,7 @@ def browse_pdf_attachment(url: str, instructions: str, max_pages: int = 6) -> st
                 "content": f"<input><task>{instructions}</task><content>{text[:8000]}</content></input>",
             },
         ]
-        client = get_llm_client(timeout=30.0)
+        client = get_llm_client(timeout=float(TimeoutConfig.LLM_CALL))
         resp = client.chat.completions.create(
             model="qwen3-max",
             stream=False,

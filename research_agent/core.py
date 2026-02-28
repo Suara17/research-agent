@@ -41,6 +41,7 @@ from .state import StateStore
 from .schema import ToolCall, Chunk, make_json_serializable
 from .planner import generate_plan
 from .executor import execute_tools_logic
+from .config import TimeoutConfig
 
 DEFAULT_SYSTEM_PROMPT = "<instruction><role>推理与搜索专家</role><task>你是一位推理与搜索大师，擅长通过演绎推理和搜索来解决复杂的多跳问题和谜题，以找到精确的答案。</task></instruction>"
 
@@ -50,10 +51,57 @@ MULTI_HOP_SYSTEM_PROMPT = """<instruction>
 </role>
 
 <protocols>
-<protocol name="语言与翻译">
-  <rule>搜索查询语言灵活性: 你被**明确授权**将搜索查询翻译成任何语言以获取最大信息量。</rule>
+<protocol name="智能语言选择">
+  <principle>不同领域的信息在不同语言的互联网上分布不均，选择正确的搜索语言能大幅提高效率和准确性。</principle>
+  
+  <guidelines name="领域-语言映射">
+    <!-- 中文优先领域 -->
+    <domain name="中国相关" language="中文">
+      中国历史、人物、地理、公司、政策、文化、娱乐、社会事件
+    </domain>
+    <domain name="中日韩区域" language="当地语言">
+      日韩人物、动漫游戏、亚洲历史 → 用中文或日文/韩文
+    </domain>
+    
+    <!-- 英文优先领域 -->
+    <domain name="欧美相关" language="英文">
+      欧美历史、人物、公司、科技、体育、娱乐
+    </domain>
+    <domain name="科学技术" language="英文">
+      学术研究、论文、生物医学、物理、化学、计算机科学
+    </domain>
+    <domain name="国际组织" language="英文">
+      联合国、国际赛事、全球奖项、跨国公司
+    </domain>
+    
+    <!-- 特殊领域 -->
+    <domain name="德语区建筑艺术" language="德文或英文">
+      德国、奥地利建筑师、艺术史、哲学 → 用德文或英文
+    </domain>
+    <domain name="法国文化" language="法文或英文">
+      法国文学、艺术、历史人物 → 用法文或英文
+    </domain>
+    <domain name="俄国相关" language="英文或俄文">
+      俄国历史、文学、科学家 → 用英文或俄文
+    </domain>
+  </guidelines>
+  
+  <strategy name="多语言搜索策略">
+    <step name="1.识别领域">分析问题涉及的主要领域和地理区域</step>
+    <step name="2.选择语言">根据领域-语言映射选择最优搜索语言</step>
+    <step name="3.交叉验证">重要信息应使用多种语言搜索验证</step>
+    <step name="4.原文追踪">书名、作品名、专有名词应追溯原文形式</step>
+  </strategy>
+  
+  <examples>
+    <example>"德裔建筑师1920年代写的书" → 用德文搜索"Wie Baut Amerika"或英文"America Picture Book Architect"</example>
+    <example>"中国航天发射" → 用中文搜索</example>
+    <example>"拟南芥蛋白质互作" → 用英文搜索"Arabidopsis protein interaction"</example>
+    <example>"法国天文学家彗星" → 用法文或英文搜索</example>
+  </examples>
+  
   <rule>答案语言一致性: 除非明确要求,否则必须用**与用户问题相同的语言**回答。</rule>
-  <rule>区域感知搜索: 对于涉及特定地区(如中国、日本)的实体,**必须**使用当地语言(中文、日文)进行搜索。</rule>
+  <rule>灵活翻译: 你被**明确授权**将搜索查询翻译成任何语言以获取最大信息量。</rule>
 </protocol>
 <protocol name="实体匹配与容错">
   <rule>语义理解: 必须识别实体的同义词、别名、历史名称、缩写、官方与民间称呼（如 "Beijing" = "Peking", "USSR" = "Soviet Union"）。</rule>
@@ -116,6 +164,40 @@ MULTI_HOP_SYSTEM_PROMPT = """<instruction>
 </phase>
 
 <phase name="搜索执行">
+  <strategy name="多假设并行验证" priority="critical">
+    <principle>**绝对禁止过早锁定单一候选！** 找到第一个候选后，必须继续探索其他可能性。</principle>
+    
+    <step name="1. 广泛搜索">初始搜索时提取 2-5 个候选答案，而非只关注第一个</step>
+    
+    <step name="2. 候选对比表">创建并维护候选对比表：
+      <table_format>
+        | 候选 | 约束1 | 约束2 | 约束3 | 验证状态 | 备注 |
+        | 候选A | ✓/?/✗ | ✓/?/✗ | ✓/?/✗ | 待验证 | 第一个发现 |
+        | 候选B | ? | ? | ? | 待探索 | 需要更多信息 |
+        | 候选C | ? | ? | ? | 待探索 | 潜在候选 |
+      </table_format>
+    </step>
+    
+    <step name="3. 切换触发条件">当以下情况发生时，必须切换到下一个候选：
+      <condition>当前候选连续 3 次搜索无法验证某个约束</condition>
+      <condition>发现当前候选存在明确矛盾 (✗)</condition>
+      <condition>验证当前候选已花费超过总步数的 30%</condition>
+      <condition>存在其他高潜力候选尚未探索</condition>
+    </step>
+    
+    <step name="4. 并行探索">在高不确定情况下，对多个候选进行并行初步验证：
+      <action>对每个候选进行 1-2 次快速验证搜索</action>
+      <action>比较各候选的匹配度</action>
+      <action>选择最有希望的候选进行深度验证</action>
+    </step>
+    
+    <rule name="禁止行为">
+      <forbidden>找到一个候选后就停止搜索其他可能性</forbidden>
+      <forbidden>连续 10+ 步只验证同一个候选而不探索替代方案</forbidden>
+      <forbidden>忽略搜索结果中提到的其他可能候选</forbidden>
+    </rule>
+  </strategy>
+  
   <strategy name="带有严格验证的顺序搜索">
     <loop>对于依赖链中的每一步:</loop>
     <step>制定搜索查询: 使用 2-3 个最具体的关键词,选择适当的语言,可以使用中文或英文，包含确切的数字/名称</step>
@@ -157,6 +239,8 @@ MULTI_HOP_SYSTEM_PROMPT = """<instruction>
     <trigger>精确特征不匹配: 找到匹配部分约束但未通过精确数字/特征匹配的候选者</trigger>
     <trigger important="true">验证条件失败 (3次规则): 某个验证条件尝试3次仍失败，但已找到候选答案</trigger>
     <trigger important="true">多路径失败: 多条验证路径都失败，需要回溯检查已找到的候选答案</trigger>
+    <trigger important="critical">**候选锁定警告**: 连续 5 步以上只验证同一个候选，必须切换到其他候选</trigger>
+    <trigger important="critical">**单候选陷阱**: 未探索其他候选就准备给出最终答案</trigger>
   </triggers>
   
   <decision_tree>
@@ -176,6 +260,13 @@ MULTI_HOP_SYSTEM_PROMPT = """<instruction>
       <no>尝试不同的关键词、语言、来源</no>
       <yes>可能需要承认信息不足</yes>
     </branch>
+    <branch question="**我是否探索了多个候选?**" priority="high">
+      <no>立即搜索其他可能候选，创建候选对比表</no>
+      <partially>继续探索未充分验证的候选</partially>
+    </branch>
+    <branch question="**当前候选验证是否遇到困难?**" priority="high">
+      <yes>切换到下一个候选，不要死磕</yes>
+    </branch>
   </decision_tree>
 </phase>
 
@@ -183,34 +274,39 @@ MULTI_HOP_SYSTEM_PROMPT = """<instruction>
   <section name="搜索阶段">
     <template>
 **当前目标:** [我正在解决哪个变量?]
-**假设:** [我对答案的当前信念]
+**候选列表:** [列出已发现的 2-5 个候选]
+**当前聚焦:** [正在验证哪个候选]
 **搜索计划:**
   查询: "[优化后的搜索查询]"
   语言: [中文/英文等]
   目的: [我正在验证什么]
-**约束验证进度:**
-  [✓] 约束 1: [证据]
-  [ ] 约束 2: 等待验证
+**候选对比表:**
+  | 候选 | 约束1 | 约束2 | 约束3 | 状态 |
+  | [A] | ✓/✗/? | ✓/✗/? | ✓/✗/? | 验证中/待探索 |
+  | [B] | ? | ? | ? | 待探索 |
 **下一步行动:** [基于结果我将做什么]
     </template>
   </section>
   
   <section name="最终答案阶段">
     <template>
-**约束验证表**
-[完整的表格]
+**候选对比表（完整）**
+| 候选 | 约束1 | 约束2 | 约束3 | 最终状态 |
+| [A] | ✓ | ✓ | ✓ | ✅ 接受 |
+| [B] | ✗ | ? | ? | ❌ 拒绝 (原因) |
+| [C] | ? | ✗ | ? | ❌ 拒绝 (原因) |
 
 **验证摘要**
-总计: [N] 个约束
-已验证: [N] ✓
-失败: 0 ✗ (必须为零)
-模棱两可: 0 ? (必须为零)
+已探索候选: [N] 个
+最终选择: [候选A]
+选择理由: [为什么选择A而非B/C]
 
-**决定:** 接受
+**约束验证表（最终候选）**
+[完整的表格]
 
 **最终答案:** [你的答案] 或者 Final Answer: [你的答案]
 
-**置信度:** 高 (所有约束经多个来源验证)
+**置信度:** 高 (所有约束经多个来源验证，已排除其他候选)
     </template>
   </section>
 </phase>
@@ -222,6 +318,9 @@ MULTI_HOP_SYSTEM_PROMPT = """<instruction>
 <mode name="忽略精确数字">接受 "足够接近" 或模糊的匹配。</mode>
 <mode name="无回溯">坚持死胡同路径而不是转向。</mode>
 <mode name="负向约束忽视">对于"不"、"无"、"没有"、"不参与"等负向约束，必须主动搜索反例证据，不能仅凭假设认为满足。</mode>
+<mode name="**过早锁定单一候选**" priority="critical">找到第一个候选后就停止探索其他可能性。必须维护候选对比表，探索 2-3 个候选后再确定最终答案。</mode>
+<mode name="**验证死磕**" priority="critical">对单个候选连续验证超过 5 步仍不切换其他候选。遇到验证困难时必须转向其他候选。</mode>
+<mode name="**确认偏误**" priority="high">只搜索支持当前假设的证据，忽略矛盾信息或替代候选。</mode>
 </failure_modes_to_avoid>
 
 <success_checklist>
@@ -237,6 +336,8 @@ MULTI_HOP_SYSTEM_PROMPT = """<instruction>
 <item>所有约束都有 ✓ (无 ✗ 或 ?)</item>
 <item>经 2 个以上来源交叉验证</item>
 <item>答案语言与问题语言一致</item>
+<item priority="critical">**已探索至少 2-3 个候选答案**</item>
+<item priority="critical">**已创建候选对比表并排除其他候选**</item>
 </success_checklist>
 
 <final_instruction>
@@ -248,6 +349,9 @@ MULTI_HOP_SYSTEM_PROMPT = """<instruction>
 2. 对于负向约束("不"、"无"、"没有"、"不参与")，必须主动搜索反例证据，证明确实"没有"该关系
 3. 如果搜索结果一直不理想，必须继续尝试不同关键词，而不是放弃验证
 4. 答案必须经过至少2个独立来源的交叉验证
+5. **【最重要】绝对禁止只验证一个候选就给出答案！必须探索 2-3 个候选，创建候选对比表，排除其他候选后才能给出最终答案**
+6. **当某个候选验证遇到困难时，立即切换到其他候选，不要死磕**
+7. **搜索结果中提到的其他可能候选，必须进行初步验证**
 
 现在按照上述所有协议进行系统的调查。
 </final_instruction>
@@ -384,10 +488,8 @@ async def agent_loop(
         limit = state.get("max_steps", max_steps)
         start_time = state.get("start_time", time.time())
         limit = state.get("max_steps", max_steps)
-        TIMEOUT_SECONDS = 600  # 10 minutes timeout
-        TIMEOUT_BUFFER = (
-            70  # Stop 70 seconds before timeout to account for LLM call latency
-        )
+        TIMEOUT_SECONDS = TimeoutConfig.GLOBAL_TIMEOUT
+        TIMEOUT_BUFFER = TimeoutConfig.GLOBAL_TIMEOUT_BUFFER
 
         elapsed = time.time() - start_time
 
@@ -615,33 +717,49 @@ Alternative approach: [What I'll try instead]
         tool_calls_buffer = {}
         content_buffer = ""
 
+        # 计算剩余时间，用于强制超时保护
+        import asyncio
+        from functools import partial
+
+        elapsed = time.time() - start_time
+        remaining_time = TIMEOUT_SECONDS - TIMEOUT_BUFFER - elapsed - 5  # 预留5秒缓冲
+        if remaining_time <= 0:
+            print(f"[DEBUG] No time left for LLM call (elapsed={elapsed:.1f}s), forcing end")
+            return {"pending_tool_calls": [], "emitted": []}
+
+        # 设置LLM调用的最大时间（不超过剩余时间，单次最多60秒）
+        llm_timeout = min(remaining_time, 60)
+        print(f"[AgentLoop] Sending request to LLM (Model: qwen3-max, timeout={llm_timeout:.1f}s, remaining={remaining_time:.1f}s)...")
+
+        def run_llm_sync():
+            return client.chat.completions.create(
+                model="qwen3-max",
+                messages=prompt_messages,
+                tools=tool_schema,
+                stream=True,
+                temperature=0.2,
+                max_tokens=5000,
+            )
+
         try:
-            print(f"[AgentLoop] Sending request to LLM (Model: qwen3-max)...")
+            # 使用 asyncio.wait_for 强制超时保护
+            stream = await asyncio.wait_for(
+                asyncio.to_thread(run_llm_sync),
+                timeout=llm_timeout
+            )
+        except asyncio.TimeoutError:
+            print(f"[DEBUG] LLM call timed out after {llm_timeout:.1f}s, forcing end")
+            return {"pending_tool_calls": [], "emitted": []}
 
-            # Use asyncio.to_thread to run sync LLM call in a separate thread
-            # This prevents blocking the event loop and allows parallelism
-            import asyncio
-            from functools import partial
-
-            # Wrapper for the sync generator to consume it and return full response
-            # Since streaming across threads is complex with asyncio.to_thread,
-            # we might need to consume the stream in the thread or use a different approach.
-            # Simplest approach for parallelism: Run the blocking call in a thread.
-
-            def run_llm_sync():
-                return client.chat.completions.create(
-                    model="qwen3-max",
-                    messages=prompt_messages,
-                    tools=tool_schema,
-                    stream=True,
-                    temperature=0.2,
-                    max_tokens=5000,
-                )
-
-            stream = await asyncio.to_thread(run_llm_sync)
-
+        try:
             print(f"[AgentLoop] Receiving stream...")
+            stream_start_time = time.time()
             for chunk in stream:
+                # 在流式处理中也检测超时
+                if time.time() - stream_start_time > llm_timeout:
+                    print(f"[DEBUG] Stream processing timed out after {llm_timeout:.1f}s, forcing end")
+                    break
+
                 chunk = cast(ChatCompletionChunk, chunk)
                 if not chunk.choices:
                     continue
@@ -729,8 +847,8 @@ Alternative approach: [What I'll try instead]
 
         MIN_STEPS_BEFORE_FINAL = max(5, limit - 10)  # At least 5 steps before final
         FINAL_CHANCE_START = limit - 3  # Last 3 steps allow best-effort answer
-        TIMEOUT_SECONDS = 600
-        TIMEOUT_BUFFER = 10
+        TIMEOUT_SECONDS = TimeoutConfig.GLOBAL_TIMEOUT
+        TIMEOUT_BUFFER = TimeoutConfig.GLOBAL_TIMEOUT_BUFFER
 
         # Check timeout status
         start_time = state.get("start_time", time.time())
@@ -891,10 +1009,8 @@ If you reach step {MIN_STEPS_BEFORE_FINAL}, you will be allowed to output your b
         MIN_STEPS_BEFORE_FINAL = max(
             5, max_steps_val - 10
         )  # At least 5 steps before final
-        TIMEOUT_SECONDS = 600  # 10 minutes timeout
-        TIMEOUT_BUFFER = (
-            70  # Stop 70 seconds before timeout to account for LLM call latency
-        )
+        TIMEOUT_SECONDS = TimeoutConfig.GLOBAL_TIMEOUT
+        TIMEOUT_BUFFER = TimeoutConfig.GLOBAL_TIMEOUT_BUFFER
 
         elapsed = time.time() - start_time
         print(
