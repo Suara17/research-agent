@@ -5,6 +5,18 @@ import urllib.parse
 from difflib import SequenceMatcher
 from typing import List, Callable, Optional, cast, Dict
 
+# 可信度评分常量
+_HIGH_CREDIBILITY_DOMAINS = [
+    "wikipedia.org", "britannica.com", "reuters.com",
+    "xinhua.net", "gov.cn", ".gov", ".edu",
+    "wikidata.org", "scholar.google.com",
+]
+_LOW_CREDIBILITY_DOMAINS = [
+    "reddit.com/r/", "quora.com", "answers.yahoo.com",
+    "zhidao.baidu.com", "tieba.baidu.com",
+]
+_CREDIBILITY_THRESHOLD = 0.15  # 低于此分值的结果直接丢弃
+
 from openai.types.chat import ChatCompletionChunk
 
 from .utils import get_llm_client
@@ -25,6 +37,46 @@ except ImportError:
 # 用于跟踪搜索循环的计数器
 _SEARCH_LOOP_COUNTER: Dict[str, int] = {}
 _MAX_LOOP_COUNT = 3  # 同一查询重复3次后触发换词
+
+
+def _compute_credibility(result: dict) -> float:
+    """
+    计算单条搜索结果的可信度分值 [0.0, 1.0]。
+    基于域名启发式，零 LLM 调用。
+    """
+    url = (result.get("url") or "").lower()
+    score = 0.5  # baseline
+
+    for domain in _HIGH_CREDIBILITY_DOMAINS:
+        if domain in url:
+            score = min(1.0, score + 0.4)
+            break
+
+    for domain in _LOW_CREDIBILITY_DOMAINS:
+        if domain in url:
+            score = max(0.0, score - 0.3)
+            break
+
+    return round(score, 2)
+
+
+def _filter_and_tag_results(results: list) -> list:
+    """
+    过滤极低可信度结果，并为每条结果附加 credibility 字段。
+    返回过滤后的结果列表（已按可信度降序排列）。
+    """
+    tagged = []
+    for r in results:
+        cred = _compute_credibility(r)
+        if cred < _CREDIBILITY_THRESHOLD:
+            print(f"[Credibility] Filtered low-credibility result: {r.get('url', '')[:60]} (score={cred})")
+            continue
+        r = dict(r)  # 浅拷贝，不改原数据
+        r["credibility"] = cred
+        tagged.append(r)
+
+    tagged.sort(key=lambda x: x.get("credibility", 0.5), reverse=True)
+    return tagged
 
 
 def _extract_key_facts(content: str, max_length: int = 800) -> str:
@@ -329,6 +381,23 @@ def execute_tools_logic(state: dict, tool_functions_map: dict, memory) -> dict:
                 else:
                     memory.add_long(tool_result_content)
             except Exception as e:
+                memory.add_long(tool_result_content)
+        elif func_name == "web_search":
+            # 可信度过滤 + 标注
+            try:
+                raw = json.loads(tool_result_content) if tool_result_content.strip().startswith(("{", "[")) else None
+                if isinstance(raw, dict) and "results" in raw:
+                    original_count = len(raw["results"])
+                    filtered = _filter_and_tag_results(raw["results"])
+                    raw["results"] = filtered
+                    credibility_tagged = json.dumps(raw, ensure_ascii=False)
+                    memory.add_long(credibility_tagged)
+                    msg_display_content = credibility_tagged
+                    print(f"[Credibility] {len(filtered)}/{original_count} results kept after filtering")
+                else:
+                    memory.add_long(tool_result_content)
+            except Exception as e:
+                print(f"[Credibility] Filter error: {e}")
                 memory.add_long(tool_result_content)
         else:
             memory.add_long(tool_result_content)
