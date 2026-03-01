@@ -387,10 +387,19 @@ def execute_tools_logic(state: dict, tool_functions_map: dict, memory) -> dict:
             try:
                 raw = json.loads(tool_result_content) if tool_result_content.strip().startswith(("{", "[")) else None
                 if isinstance(raw, dict) and "results" in raw:
+                    # 兼容 {"results": [...]} 格式（备用）
                     original_count = len(raw["results"])
                     filtered = _filter_and_tag_results(raw["results"])
                     raw["results"] = filtered
                     credibility_tagged = json.dumps(raw, ensure_ascii=False)
+                    memory.add_long(credibility_tagged)
+                    msg_display_content = credibility_tagged
+                    print(f"[Credibility] {len(filtered)}/{original_count} results kept after filtering")
+                elif isinstance(raw, list):
+                    # 实际路径：serper / bocha / searxng 均返回裸 List[Dict]
+                    original_count = len(raw)
+                    filtered = _filter_and_tag_results(raw)
+                    credibility_tagged = json.dumps(filtered, ensure_ascii=False)
                     memory.add_long(credibility_tagged)
                     msg_display_content = credibility_tagged
                     print(f"[Credibility] {len(filtered)}/{original_count} results kept after filtering")
