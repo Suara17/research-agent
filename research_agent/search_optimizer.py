@@ -165,41 +165,86 @@ def select_search_engine_by_type(query_type: dict) -> str:
     return "serper"
 
 
-def rerank_by_query_type(results: list, query: str, query_type: dict) -> list:
-    """基于问题类型对结果进行相关性重排"""
+def rerank_by_query_type(results: list, query: str, query_type: dict, slots: Optional[dict] = None) -> list:
+    """基于问题类型对结果进行相关性重排。
+
+    评分维度（叠加）：
+    1. 原有关键词命中 (+0.5/次)
+    2. 来源域名权威性 (+0.3 ~ +1.5)
+    3. anchor 精确命中 (+2.0/个)
+    4. 硬约束全命中奖励 (+3.0) / 全未命中惩罚 (-2.0)
+    5. 原有领域不相关惩罚 (-1.0)
+    """
     if not results:
         return results
-    
+
     strategy = query_type.get("search_strategy", "general")
     target_type = query_type.get("target_type", "unknown")
-    
+
+    # --- 1. 原有关键词集合 ---
     key_concepts = set()
     if target_type == "company":
         key_concepts.update(["公司", "出版社", "集团", "企业", "corporation", "company", "inc", "ltd"])
     elif target_type == "person":
         key_concepts.update(["人", "作者", "创始人", "person", "founder", "born", "died"])
-    
+
     if strategy == "company_focused":
         key_concepts.update(["创办", "创始人", "总部", "founder", "established"])
     elif strategy == "person_focused":
         key_concepts.update(["出生于", "逝世", "著名", "born", "died", "famous"])
-    
+
+    # --- 2. 权威域名得分表 ---
+    AUTHORITY_SCORES = {
+        "wikipedia.org": 1.5,
+        "wikidata.org": 1.2,
+        "britannica.com": 1.0,
+        "reuters.com": 0.8,
+        "xinhua.net": 0.8,
+        ".gov": 0.7,
+        ".edu": 0.6,
+    }
+
+    # --- 3. 从 slots 取 anchors 和 hard_constraints ---
+    slot_anchors: List[str] = (slots or {}).get("anchors") or []
+    hard_constraints: List[str] = (slots or {}).get("hard_constraints") or []
+
     scored = []
     for r in results:
         score = r.get("score", 0.5)
         content = (r.get("title", "") + " " + r.get("summary", "")).lower()
-        
+        url = r.get("url", "").lower()
+
+        # 维度1: 关键词命中
         for concept in key_concepts:
             if concept.lower() in content:
                 score += 0.5
-        
-        # 惩罚不相关（公司查询但出现天文内容）
+
+        # 维度2: 域名权威性
+        for domain, bonus in AUTHORITY_SCORES.items():
+            if domain in url:
+                score += bonus
+                break  # 只取最高匹配
+
+        # 维度3: anchor 精确命中
+        for anchor in slot_anchors:
+            if anchor.lower() in content:
+                score += 2.0
+
+        # 维度4: 硬约束命中情况
+        if hard_constraints:
+            hits = sum(1 for c in hard_constraints if c.lower() in content)
+            if hits == len(hard_constraints):
+                score += 3.0  # 全命中大奖励
+            elif hits == 0:
+                score -= 2.0  # 全未命中大惩罚
+
+        # 维度5: 领域不相关惩罚（保留原逻辑）
         if target_type == "company" or strategy == "company_focused":
             if any(kw in content for kw in ["天文学", "恒星", "astronomy"]):
                 if not any(c in content for c in ["公司", "corporation", "company", "集团"]):
                     score -= 1.0
-        
+
         scored.append((r, score))
-    
+
     scored.sort(key=lambda x: x[1], reverse=True)
     return [r for r, s in scored]
