@@ -36,7 +36,7 @@ except ImportError:
 
 # 用于跟踪搜索循环的计数器
 _SEARCH_LOOP_COUNTER: Dict[str, int] = {}
-_MAX_LOOP_COUNT = 3  # 同一查询重复3次后触发换词
+_MAX_LOOP_COUNT = 2  # 同一查询重复2次后触发换词（更早介入）
 
 
 def _compute_credibility(result: dict) -> float:
