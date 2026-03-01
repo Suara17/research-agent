@@ -80,6 +80,8 @@ class TimeoutConfig:
     
     # --- LLM调用超时 ---
     LLM_CALL = 10
+    # 单次 Agent LLM 调用最大超时（秒），上下文较长时需要更多时间
+    LLM_AGENT_CALL = 100
     
     # --- 重定向解析超时 ---
     REDIRECT_RESOLVE = 5

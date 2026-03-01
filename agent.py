@@ -28,7 +28,6 @@ from research_agent import (
     get_weather,
     clean_answer,
     verify_and_clean_answer,
-    CandidatePool,
 )
 from research_agent.answer_synthesis import (
     synthesize_best_answer,
@@ -200,7 +199,7 @@ async def query(req: QueryRequest) -> QueryResponse:
 
         # Add a system hint to differentiate them slightly (optional, but good for diversity)
         # For now, we rely on temperature randomness
-        
+
         async def _run_agent_loop():
             async for chunk in agent_loop(
                 messages,
@@ -217,9 +216,12 @@ async def query(req: QueryRequest) -> QueryResponse:
             ):
                 if chunk.type == "text" and chunk.content:
                     trace_chunks.append(chunk.content)
-            
+
             full_trace = "".join(trace_chunks)
-            return {"id": agent_id, "trace": full_trace, "answer": ""}
+            # 从 trace 中提取候选答案，避免 answer 字段空置导致兜底失败
+            from research_agent.answer_synthesis import _extract_last_candidate
+            extracted = _extract_last_candidate(full_trace)
+            return {"id": agent_id, "trace": full_trace, "answer": extracted}
 
         try:
             # 使用 asyncio.wait_for 强制整体超时
@@ -227,7 +229,11 @@ async def query(req: QueryRequest) -> QueryResponse:
         except asyncio.TimeoutError:
             print(f"[Agent {agent_id}] Total timeout ({TOTAL_TIMEOUT}s) exceeded, returning partial result")
             full_trace = "".join(trace_chunks)
-            return {"id": agent_id, "trace": full_trace, "answer": ""}
+            # 超时时同样从已有 trace 提取最佳候选答案
+            from research_agent.answer_synthesis import _extract_last_candidate
+            extracted = _extract_last_candidate(full_trace)
+            print(f"[Agent {agent_id}] Extracted answer from partial trace: {extracted[:80] if extracted else '(empty)'}")
+            return {"id": agent_id, "trace": full_trace, "answer": extracted}
 
     # Determine number of agents to run in parallel
     num_agents = int(
@@ -269,7 +275,11 @@ async def query(req: QueryRequest) -> QueryResponse:
     )
 
     # Synthesize the final answer
-    final_answer = synthesize_best_answer(req.question, results)
+    final_answer = synthesize_best_answer(
+        req.question,
+        results,
+        original_question=req.question,
+    )
 
     # 打印返回的JSON响应
     print(

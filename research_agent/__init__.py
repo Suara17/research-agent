@@ -11,10 +11,9 @@ from .search import (
 )
 from .memory import MemoryStore
 from .utils import (
-    get_llm_client, 
-    get_session, 
-    clean_answer, 
-    CandidatePool
+    get_llm_client,
+    get_session,
+    clean_answer,
 )
 from .answer_synthesis import verify_and_clean_answer
 from .state import StateStore

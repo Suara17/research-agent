@@ -6,11 +6,6 @@ from .sensitive_filter import sanitize_text_for_llm, is_content_inspection_error
 
 logger = logging.getLogger(__name__)
 
-# _extract_core_entities function removed as per user request to rely on model reasoning.
-
-def extract_entities(query: str) -> str:
-    # _extract_core_entities is removed. Returning empty list.
-    return json.dumps({"entities": []}, ensure_ascii=False)
 
 def _optimize_search_query(query: str) -> str:
     """
@@ -69,13 +64,6 @@ def _simplify_search_query(query: str) -> str:
     except Exception:
         return query
 
-def _create_entity_query(query: str) -> str:
-    """
-    Deprecated: Entity-based fallback query generation is removed.
-    Returns empty string to disable this fallback.
-    """
-    return ""
-
 def _translate_query(query: str, target_lang: str = "English") -> str:
     try:
         client = get_llm_client()
@@ -116,6 +104,25 @@ def expand_query_language(query: str) -> list:
             
     return queries
 
+def _fallback_slot_extraction(query: str) -> dict:
+    """LLM 失败时的降级槽位提取（纯正则，零延迟）"""
+    import re
+
+    is_chinese = any("\u4e00" <= ch <= "\u9fff" for ch in query)
+    years = re.findall(r"\b(19|20)\d{2}s?\b", query)
+    quoted = re.findall(r'"([^"]+)"', query)
+    books = re.findall(r"《([^》]+)》", query)
+    anchors = quoted + books
+
+    return {
+        "type": "Unknown",
+        "hard_constraints": years if years else [],
+        "soft_constraints": [],
+        "anchors": anchors,
+        "target_country": None,
+    }
+
+
 def _extract_search_slots(query: str) -> dict:
     try:
         client = get_llm_client()
@@ -146,7 +153,10 @@ def _extract_search_slots(query: str) -> dict:
             max_tokens=256,
             response_format={"type": "json_object"}
         )
-        return json.loads(resp.choices[0].message.content)
+        result = resp.choices[0].message.content
+        if result:
+            return json.loads(result)
+        return {}
     except Exception as e:
         print(f"[Monitoring] Slot extraction failed: {e}")
-        return {}
+        return _fallback_slot_extraction(query)

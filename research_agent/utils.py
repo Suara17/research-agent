@@ -53,21 +53,27 @@ def clean_answer(raw_answer: str) -> str:
     if not raw_answer:
         return ""
     
-    # 0. 优先提取 "Final Answer:" 后的内容
-    # Use regex to find "Final Answer:" (case insensitive) and capture everything after it
-    # We look for the last occurrence to avoid capturing intermediate thoughts if any slipped through
-    final_answer_match = re.search(r"Final Answer[:：]\s*(.*)", raw_answer, re.IGNORECASE | re.DOTALL)
-    if final_answer_match:
-        # If found, replace raw_answer with the captured content
-        # We take the content after the marker
-        extracted = final_answer_match.group(1).strip()
+    # 0. 优先提取答案标记后的内容（取最后一次出现，避免中间过程干扰）
+    # 覆盖常见中英文答案标记变体
+    _ANSWER_MARKERS = (
+        r"Final Answer",       # 英文标准格式
+        r"最终答案",            # 中文标准格式
+        r"正确答案",
+        r"答案",               # 通用中文（放最后，避免误匹配"答案是..."推理过程）
+        r"The Answer",
+        r"Answer",
+    )
+    _MARKER_PATTERN = r"(?:" + "|".join(_ANSWER_MARKERS) + r")[:：]\s*(.*)"
+    # findall 取所有匹配，使用最后一个（最终答案总在末尾）
+    all_matches = re.findall(_MARKER_PATTERN, raw_answer, re.IGNORECASE | re.DOTALL)
+    if all_matches:
+        extracted = all_matches[-1].strip()
         if extracted:
-             raw_answer = extracted
-             # Also check if there are any trailing "Thought:" sections and remove them
-             # (In case the model outputs Final Answer then starts thinking again)
-             thought_match = re.search(r"(.*?)Thought[:：]", raw_answer, re.IGNORECASE | re.DOTALL)
-             if thought_match:
-                 raw_answer = thought_match.group(1).strip()
+            raw_answer = extracted
+            # 截断 Thought:/Action: 等推理痕迹（模型在答案后继续推理的情况）
+            thought_match = re.search(r"(.*?)(?:Thought|Action|Observation)[:：]", raw_answer, re.IGNORECASE | re.DOTALL)
+            if thought_match:
+                raw_answer = thought_match.group(1).strip()
 
     # 1. 去除 Markdown 标记 (只去除 ``` 符号，保留内容)
     clean = re.sub(r'```\w*', '', raw_answer)
@@ -86,16 +92,16 @@ def clean_answer(raw_answer: str) -> str:
     except:
         pass
 
-    # 3. 去除常见的废话前缀/后缀
+    # 3. 去除常见的废话前缀（与第0步标记列表保持一致，兜底处理第0步未命中的情况）
     patterns = [
-        r"^(answer|final answer|the answer is|output)[:：\s-]*",
+        r"^(?:Final Answer|最终答案|正确答案|答案|The Answer|Answer)[:：]\s*",
+        r"^(?:answer|the answer is|output)[:：\s-]*",
         r"^答案是[:：]\s*",
         r"^The answer is[:：]\s*",
         r"^根据搜索结果[:：,，]\s*",
-        r"^Final Answer[:：]\s*",
         r"^综上所述[:：,，]\s*",
         r"^经检索[:：,，]\s*",
-        r"^因此[:：,，]\s*"
+        r"^因此[:：,，]\s*",
     ]
     
     for _ in range(3):
@@ -155,36 +161,6 @@ def clean_answer(raw_answer: str) -> str:
                 clean = chunks[-1]
                 print(f"[CleanAnswer] 检测到年份混乱拼接，修正: '{clean}' (原始: {chunks})")
 
-    # [New] LLM Fallback: If result is still a thought trace (regex failed)
-    # Trigger if:
-    # 1. Contains thought keywords
-    # 2. OR Length > 20 words (English) or > 60 chars (approx 20-30 Chinese words/chars context)
-    # Use a simple heuristic: split by space for words, or raw length for CJK
-    word_count = len(clean.split())
-    
-    if (len(clean) > 60 or word_count > 20) or any(k in clean for k in ["Thought:", "Action:", "Observation:", "Step 1:", "首先", "我需要"]):
-        print("[CleanAnswer] Result is long or looks like a trace. Attempting LLM extraction...")
-        try:
-            client = get_llm_client()
-            response = client.chat.completions.create(
-                model="qwen3-max",
-                messages=[
-                    {"role": "system", "content": "<instruction><role>Answer Extractor</role><task>Read the provided text and extract the Final Answer.</task><rules><rule>Output ONLY the answer text.</rule><rule>Do not output 'The answer is...'.</rule><rule>If no answer is found, output the most relevant conclusion.</rule></rules></instruction>"},
-                    {"role": "user", "content": f"<input><text>{clean[:2000]}</text></input>"} # Truncate to avoid context limit
-                ],
-                temperature=0.1,
-                max_tokens=200
-            )
-            extracted = response.choices[0].message.content.strip()
-            # Basic validation of extracted answer
-            if extracted and len(extracted) < len(clean):
-                 # Recurse once to clean the LLM output (e.g. remove quotes)
-                 # But avoid infinite recursion by ensuring length reduced
-                 clean = extracted.strip(" `\"'")
-                 print(f"[CleanAnswer] LLM Extracted: {clean[:50]}...")
-        except Exception as e:
-            print(f"[CleanAnswer] LLM Extraction failed: {e}")
-
     # 原有去重逻辑
     m = re.match(r'^(.+?)(?:[ \t\n。,;!?.|]+)\1$', clean, re.IGNORECASE | re.DOTALL)
     if m:
@@ -204,56 +180,6 @@ def clean_answer(raw_answer: str) -> str:
                     found_prefix_dupe = True
             
     return clean
-
-class CandidatePool:
-    """候选答案池 - 管理多个候选答案,避免重复验证相同错误答案"""
-    def __init__(self):
-        self.candidates = []  # [(answer, confidence, sources)]
-        self.rejected = []    # [(answer, reason)]
-
-    def add_candidate(self, answer: str, confidence: float, sources: list):
-        """添加候选答案(自动去重)"""
-        # 使用 clean_answer 进行标准化清洗
-        answer = clean_answer(answer)
-        if not answer:
-            return
-
-        # 去重检查
-        if not any(self._is_similar(answer, c[0]) for c in self.candidates):
-            self.candidates.append((answer, confidence, sources))
-            # 按置信度排序
-            self.candidates.sort(key=lambda x: x[1], reverse=True)
-            print(f"[CandidatePool] Added: '{answer}' (confidence={confidence:.2f})")
-
-    def reject(self, answer: str, reason: str):
-        """拒绝某个答案,并从候选池移除"""
-        answer = str(answer or "").strip()
-        if not answer:
-            return
-
-        self.rejected.append((answer, reason))
-        # 从候选池移除相似答案
-        self.candidates = [c for c in self.candidates
-                          if not self._is_similar(answer, c[0])]
-        print(f"[CandidatePool] Rejected: '{answer[:50]}...' (total rejected={len(self.rejected)})")
-
-    def get_next_best(self) -> Optional[str]:
-        """返回下一个未尝试的最高分候选"""
-        for ans, conf, sources in self.candidates:
-            # 检查是否已被拒绝
-            if not any(self._is_similar(ans, r[0]) for r in self.rejected):
-                print(f"[CandidatePool] Next candidate: '{ans}' (confidence={conf:.2f}, sources={len(sources)})")
-                return ans
-        return None
-
-    def _is_similar(self, a: str, b: str) -> bool:
-        """判断两个答案是否相似(>80%重合)"""
-        from difflib import SequenceMatcher
-        return SequenceMatcher(None, a.lower(), b.lower()).ratio() > 0.8
-
-    def get_rejected_names(self) -> list:
-        """获取所有被拒绝的答案名称"""
-        return [r[0] for r in self.rejected]
 
 # -------------------------------------------------------------------------
 # Type Conversion & Schema

@@ -5,6 +5,9 @@ import urllib.parse
 from difflib import SequenceMatcher
 from typing import List, Callable, Optional, cast, Dict
 
+from .search_optimizer import classify_query_type, rerank_by_query_type
+from .processors import _extract_search_slots
+
 # 可信度评分常量
 _HIGH_CREDIBILITY_DOMAINS = [
     "wikipedia.org", "britannica.com", "reuters.com",
@@ -390,6 +393,9 @@ def execute_tools_logic(state: dict, tool_functions_map: dict, memory) -> dict:
                     # 兼容 {"results": [...]} 格式（备用）
                     original_count = len(raw["results"])
                     filtered = _filter_and_tag_results(raw["results"])
+                    query_type = classify_query_type(q0)
+                    slots = _extract_search_slots(q0)
+                    filtered = rerank_by_query_type(filtered, q0, query_type, slots)
                     raw["results"] = filtered
                     credibility_tagged = json.dumps(raw, ensure_ascii=False)
                     memory.add_long(credibility_tagged)
@@ -399,6 +405,9 @@ def execute_tools_logic(state: dict, tool_functions_map: dict, memory) -> dict:
                     # 实际路径：serper / bocha / searxng 均返回裸 List[Dict]
                     original_count = len(raw)
                     filtered = _filter_and_tag_results(raw)
+                    query_type = classify_query_type(q0)
+                    slots = _extract_search_slots(q0)
+                    filtered = rerank_by_query_type(filtered, q0, query_type, slots)
                     credibility_tagged = json.dumps(filtered, ensure_ascii=False)
                     memory.add_long(credibility_tagged)
                     msg_display_content = credibility_tagged

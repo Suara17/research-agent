@@ -487,7 +487,6 @@ async def agent_loop(
         current_step = state["step_index"]
         limit = state.get("max_steps", max_steps)
         start_time = state.get("start_time", time.time())
-        limit = state.get("max_steps", max_steps)
         TIMEOUT_SECONDS = TimeoutConfig.GLOBAL_TIMEOUT
         TIMEOUT_BUFFER = TimeoutConfig.GLOBAL_TIMEOUT_BUFFER
 
@@ -713,6 +712,7 @@ Alternative approach: [What I'll try instead]
             )
 
         # Call LLM
+        force_continue = False  # 初始化，避免依赖 locals() 检测
         emitted = []
         tool_calls_buffer = {}
         content_buffer = ""
@@ -728,7 +728,7 @@ Alternative approach: [What I'll try instead]
             return {"pending_tool_calls": [], "emitted": []}
 
         # 设置LLM调用的最大时间（不超过剩余时间，单次最多60秒）
-        llm_timeout = min(remaining_time, 60)
+        llm_timeout = min(remaining_time, TimeoutConfig.LLM_AGENT_CALL)
         print(f"[AgentLoop] Sending request to LLM (Model: qwen3-max, timeout={llm_timeout:.1f}s, remaining={remaining_time:.1f}s)...")
 
         def run_llm_sync():
@@ -976,10 +976,6 @@ If you reach step {MIN_STEPS_BEFORE_FINAL}, you will be allowed to output your b
                         f"\n\n[System] Answer Verification Error: {str(e)}"
                     )
 
-        # Default force_continue value if not set in any branch
-        if "force_continue" not in locals():
-            force_continue = False
-
         return {
             "messages": new_messages,
             "pending_tool_calls": pending_tool_calls,
@@ -1039,12 +1035,29 @@ If you reach step {MIN_STEPS_BEFORE_FINAL}, you will be allowed to output your b
         if pending_calls:
             return "tools"
 
-        # BUG FIX: If we haven't reached minimum steps, continue even with empty content
+        # 只有在有实质内容时才强制继续到最小步数，超时或纯空转时不浪费步数
+        # 避免 LLM 超时后空转一步无意义地消耗时间
         if current_step < MIN_STEPS_BEFORE_FINAL:
-            print(
-                f"[DEBUG] Step {current_step} < {MIN_STEPS_BEFORE_FINAL}, forcing continue to reach minimum steps"
+            # 检查上一轮是否有实质输出（通过 messages 最后一条判断）
+            messages = state.get("messages", [])
+            last_assistant = next(
+                (m for m in reversed(messages) if m.get("role") == "assistant"),
+                None,
             )
-            return "tools"
+            has_content = bool(
+                last_assistant
+                and (last_assistant.get("content") or last_assistant.get("tool_calls"))
+            )
+            if has_content:
+                print(
+                    f"[DEBUG] Step {current_step} < {MIN_STEPS_BEFORE_FINAL}, forcing continue to reach minimum steps"
+                )
+                return "tools"
+            else:
+                print(
+                    f"[DEBUG] Step {current_step} < {MIN_STEPS_BEFORE_FINAL}, but last round had no content (timeout?), ending"
+                )
+                return "__end__"
 
         return "__end__"
 

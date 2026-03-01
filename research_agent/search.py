@@ -1094,48 +1094,59 @@ def extract_answer_from_search_results(search_results: list, query: str) -> dict
         return {"candidates": [], "extraction_method": "error"}
 
 
-# Wikipedia 查询限定模式
-_WIKI_ENTITY_PATTERNS = [
-    r"^(Who|What|Where|When|Which)\s+(was|is|were|are|did|do)\s+",
-    r"^(Who|What|Where|Which)\s+(was|is|were|are|did|do)\s+[\w\s]+\?$",
-    r"^(法国|德国|美国|英国 日本|意大利|西班牙|俄罗斯|中国人|美国人|英国人|德国人|法国人|日本人|意大利人|俄罗斯人)",
-    r"^(谁|什么|哪里|哪个|何时|怎样|如何|为什么|哪一年|哪国|哪位)",  # 问句开头
-    r"(谁|什么|哪里|哪个|何时|怎样|如何|为什么)是",
-    r"《.+》",
-    r"^\d{4}.*(年|出生于|逝世|去世|创立|成立)",
-    r"^(first|second|third|latest|new)\s+(book|film|movie|novel|president|king|queen|architect)",
-    r"(first|second|third)\s+(Hispanic|Asian|African|American|European)\s+",
-    r"(born|died|born in|died in|lived in|married to)",
-    r"^(请帮我|查找|搜索|关于|我想知道|有没有)",
-    r"\s(书|电影|小说|建筑|公司|组织|机构|大学|医院|博物馆|图书馆|机场|车站|酒店|餐厅|医院)\s*$",
-    r"\s(是谁|是什么|在哪|建于)",
+# 事实性人物/机构定义类问句模式（仅这类查询才加 site:wikipedia.org）
+# 要求：明确指向"某人是谁/某机构是什么"，且不含游戏/娱乐/列表类关键词
+_FACTUAL_DEFINITION_PATTERNS = [
+    r"^(who|what)\s+(was|is|were|are)\s+[\w\s]{2,40}\?$",          # "Who was X?" / "What is X?"
+    r"(born|died|born in|died in|founded in|established in)",        # 人物/机构生卒/成立
+    r"^(first|second|third)\s+(Hispanic|Asian|African|American|European)\s+\w+",  # 历史第一人
+    r"(诺贝尔|Nobel).*(奖|prize|laureate)",                          # 诺贝尔奖得主
+    r"^\d{4}.*(出生于|逝世|去世|创立|成立)",                         # 年份+事件定义
+]
+
+# 游戏/娱乐/列表类关键词——命中则不加 wikipedia 限定
+_NON_WIKI_KEYWORDS = [
+    "game", "games", "valorant", "league of legends", "fortnite", "minecraft",
+    "weapon", "skin", "melee", "character", "hero", "champion", "agent",
+    "anime", "manga", "movie", "film", "song", "album", "tv show",
+    "list", "all", "complete list", "how many", "weapons list",
+    "格斗", "手游", "游戏", "武器", "皮肤", "角色", "英雄", "技能",
+    "拳皇", "王者荣耀", "valorant", "无畏契约", "英雄联盟",
 ]
 
 
-# 检测是否为实体类查询
-def _is_entity_query(query: str) -> bool:
-    """检测查询是否为实体类查询（人名、地名、书名等）"""
+def _is_factual_definition_query(query: str) -> bool:
+    """
+    检测查询是否为事实性人物/机构定义类问句。
+    仅此类查询才允许追加 site:wikipedia.org 限定。
+
+    排除条件（优先）：
+    - 含游戏/娱乐/列表类关键词
+    - 含引号（通常是精确匹配搜索，不适合加限定）
+    - 含问号但不符合定义类模式（如 "Valorant melee weapon names?"）
+    """
     query_lower = query.lower().strip()
 
-    # 检查是否匹配 Wikipedia 实体查询模式
-    for pattern in _WIKI_ENTITY_PATTERNS:
-        if re.match(pattern, query, re.IGNORECASE):
+    # 排除：含游戏/娱乐/列表类关键词
+    if any(kw in query_lower for kw in _NON_WIKI_KEYWORDS):
+        return False
+
+    # 排除：含引号（精确搜索，不加限定）
+    if '"' in query:
+        return False
+
+    # 匹配：事实性定义类模式
+    for pattern in _FACTUAL_DEFINITION_PATTERNS:
+        if re.search(pattern, query, re.IGNORECASE):
             return True
 
-    # 检查是否包含明显的实体标识
-    entity_indicators = [
-        '"',
-        "《",
-        "》",  # 引号、书名号
-    ]
-    if any(indicator in query for indicator in entity_indicators):
-        return True
-
-    # 检查是否以问号结尾（通常是实体查询）
-    if query.strip().endswith("?"):
-        return True
-
     return False
+
+
+# 保留旧名称供内部兼容（不再对外暴露语义）
+def _is_entity_query(query: str) -> bool:
+    """已收窄语义：仅事实性定义类查询返回 True，用于决定是否加 wikipedia 限定"""
+    return _is_factual_definition_query(query)
 
 
 def _optimize_search_query(query: str) -> str:
@@ -2747,15 +2758,16 @@ def web_search(query: str, top_k: int = 8) -> str:
         lang_info = _detect_query_domain_and_languages(query)
         print(f"[Search] Domain detected: {lang_info['domain']}, primary language: {lang_info['primary_language']}, reason: {lang_info['reason']}")
 
-        # 1.5. 对实体类查询添加 Wikipedia 限定（仅对Serper英文搜索有效）
-        if _is_entity_query(query) and "site:" not in optimized_q.lower():
-            # 检测查询语言，选择合适的 Wikipedia 站点
-            # 注意：仅对非中文查询添加Wikipedia限定，中文查询不添加以避免限制搜索结果
+        # 1.5. 仅对"事实性人物/机构定义类问句"追加 site:wikipedia.org 限定
+        # 首轮：加限定后若 Serper 返回 0 结果，二次搜索时自动移除（见下方二次检索逻辑）
+        _wiki_site_added = False
+        if _is_factual_definition_query(query) and "site:" not in optimized_q.lower():
             is_chinese_query = any("\u4e00" <= ch <= "\u9fff" for ch in query[:50])
             if not is_chinese_query:
                 optimized_q = f"{optimized_q} site:wikipedia.org"
+                _wiki_site_added = True
                 print(
-                    f"[Monitoring] Entity query detected, added Wikipedia site限定: {optimized_q[:80]}..."
+                    f"[Monitoring] Factual definition query, added site:wikipedia.org: {optimized_q[:80]}..."
                 )
 
         is_chinese = any("\u4e00" <= ch <= "\u9fff" for ch in optimized_q)
@@ -2783,17 +2795,9 @@ def web_search(query: str, top_k: int = 8) -> str:
                 else:
                     print(f"[Search] Bocha returned insufficient results ({len(bocha_results) if bocha_results else 0}), falling back to parallel search")
 
-            # 如果博查结果不足，使用其他引擎并行
+            # 如果博查结果不足，使用其他引擎并行（已移除 SearXNG）
             if len(all_results) < MIN_RESULTS_THRESHOLD:
                 tasks = []
-
-                # Task: SearXNG - 熔断器打开时跳过，避免等待超时
-                if searxng_base_url and not _SEARXNG_CB.is_open():
-                    tasks.append(
-                        lambda: _safe_search_searxng(optimized_q, top_k, searxng_base_url)
-                    )
-                elif searxng_base_url and _SEARXNG_CB.is_open():
-                    print("[SearXNG] Circuit breaker open, skipping SearXNG this round")
 
                 # Task: Baidu direct
                 tasks.append(lambda: _safe_search_baidu_direct(optimized_q, top_k))
@@ -2838,18 +2842,18 @@ def web_search(query: str, top_k: int = 8) -> str:
                     primary_provider = "serper"
                 else:
                     print(f"[Search] Serper returned insufficient results ({len(serper_results) if serper_results else 0}), falling back to parallel search")
+                    # 二次检索：若首轮加了 site:wikipedia.org 但结果不足，移除限定后重试
+                    if _wiki_site_added and len(serper_results or []) == 0:
+                        fallback_q = re.sub(r'\s*site:\S+', '', optimized_q).strip()
+                        print(f"[Search] Wikipedia site限定导致0结果，移除后重试: {fallback_q[:60]}...")
+                        retry_results = _safe_search_serper(fallback_q, top_k, serper_key)
+                        if retry_results and len(retry_results) >= MIN_RESULTS_THRESHOLD:
+                            all_results = retry_results
+                            primary_provider = "serper_retry"
 
-            # 如果 Serper 结果不足，使用其他引擎并行
+            # 如果 Serper 结果仍不足，使用其他引擎并行（已移除 SearXNG）
             if len(all_results) < MIN_RESULTS_THRESHOLD:
                 tasks = []
-
-                # Task: SearXNG - 熔断器打开时跳过，避免等待超时
-                if searxng_base_url and not _SEARXNG_CB.is_open():
-                    tasks.append(
-                        lambda: _safe_search_searxng(optimized_q, top_k, searxng_base_url)
-                    )
-                elif searxng_base_url and _SEARXNG_CB.is_open():
-                    print("[SearXNG] Circuit breaker open, skipping SearXNG this round")
 
                 # Task: DuckDuckGo (parallel) - 已禁用，耗时太长
                 # if _DDGS_AVAILABLE:
@@ -2872,7 +2876,7 @@ def web_search(query: str, top_k: int = 8) -> str:
         if len(all_results) < MIN_RESULTS_THRESHOLD and len(lang_info.get("recommended_languages", [])) > 1:
             print(f"[Search] Results insufficient, trying multi-language expansion...")
             expanded_queries = []
-            
+
             # 根据推荐的额外语言生成翻译查询
             for lang in lang_info["recommended_languages"]:
                 if lang == lang_info["primary_language"]:
@@ -2881,7 +2885,7 @@ def web_search(query: str, top_k: int = 8) -> str:
                     continue
                 if lang == "en" and not is_chinese:
                     continue
-                    
+
                 # 翻译查询
                 translation_map = {"en": "English", "zh": "Chinese", "de": "German", "fr": "French", "ja": "Japanese"}
                 target_lang = translation_map.get(lang, "English")
@@ -2889,7 +2893,7 @@ def web_search(query: str, top_k: int = 8) -> str:
                 if translated_q and translated_q.lower() != optimized_q.lower():
                     expanded_queries.append(translated_q)
                     print(f"[Search] Multi-lang expansion: {lang} -> {translated_q[:50]}...")
-            
+
             # 对扩展查询执行搜索
             for exp_q in expanded_queries[:2]:  # 最多尝试2个扩展查询
                 if serper_key:
@@ -3375,6 +3379,44 @@ def web_fetch(url: str, max_bytes: int = 200_000, force_refresh: bool = False) -
                                 source_type = "drission_browser_fallback"
                 except Exception as e:
                     print(f"[WebFetch] Heavyweight fetch failed: {e}")
+
+            # Phase 3: wiki.gg 备用策略
+            # 当 fandom.com 返回 451/空内容时，尝试 wiki.gg 对应页面
+            if not content_result and "fandom.com" in parsed.netloc:
+                try:
+                    # 从 fandom URL 提取 wiki 名称和页面路径
+                    # 格式: https://<game>.fandom.com/wiki/<Page>
+                    # 转换: https://wiki.gg/<game>/wiki/<Page>
+                    fandom_match = re.match(
+                        r"https?://([^.]+)\.fandom\.com(/wiki/.+)", url, re.IGNORECASE
+                    )
+                    if fandom_match:
+                        game_name = fandom_match.group(1)
+                        wiki_path = fandom_match.group(2)
+                        wiki_gg_url = f"https://wiki.gg/{game_name}{wiki_path}"
+                        print(f"[WebFetch] fandom.com failed, trying wiki.gg: {wiki_gg_url}")
+                        wiki_gg_text = _fetch_with_curl_cffi(wiki_gg_url)
+                        if not wiki_gg_text:
+                            wiki_gg_text = _fetch_with_jina(wiki_gg_url, _GLOBAL_SESSION)
+                        if wiki_gg_text and len(wiki_gg_text) > 200:
+                            content_result = wiki_gg_text
+                            source_type = "wiki_gg_fallback"
+                            print(f"[WebFetch] wiki.gg fallback succeeded for {wiki_gg_url}")
+                        else:
+                            # wiki.gg 也失败，尝试直接搜索
+                            page_name = wiki_path.replace("/wiki/", "").replace("_", " ")
+                            fallback_search_q = f"site:wiki.gg {game_name} {page_name}"
+                            print(f"[WebFetch] wiki.gg fetch failed, searching: {fallback_search_q}")
+                            if serper_key := os.getenv("SERPER_API_KEY"):
+                                sr = _safe_search_serper(fallback_search_q, 3, serper_key)
+                                if sr:
+                                    first = sr[0]
+                                    snippet = first.get("summary") or first.get("snippet") or ""
+                                    if snippet:
+                                        content_result = f"[wiki.gg search result]\nTitle: {first.get('title','')}\n{snippet}"
+                                        source_type = "wiki_gg_search_fallback"
+                except Exception as e_wiki_gg:
+                    print(f"[WebFetch] wiki.gg fallback failed: {e_wiki_gg}")
 
             if content_result:
                 # 压缩内容：从15000字符减少到5000字符

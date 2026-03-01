@@ -511,7 +511,11 @@ INSTRUCTION: Analyze the rejection reasons. Change your search strategy to avoid
     )
 
     # Synthesize
-    final_answer = synthesize_best_answer(question, agent_results)
+    final_answer = synthesize_best_answer(
+        question,
+        agent_results,
+        original_question=question,
+    )
 
     # Combine traces and summaries for logging/debugging
     combined_trace = ""
@@ -570,6 +574,7 @@ async def main():
 
     src = "validation.jsonl"
     out = "validation_results.jsonl"
+    debug_out = "validation_results_debug.jsonl"
 
     if not os.path.exists(src):
         logging.error(f"File not found: {src}")
@@ -625,7 +630,14 @@ async def main():
             question, ground_truth, prediction
         )
 
+        # Submission format: only id + answer
         result_item = {
+            "id": qid,
+            "answer": cleaned_prediction,
+        }
+
+        # Keep rich diagnostics in a separate file for debugging/analysis
+        debug_item = {
             "id": qid,
             "question": question,
             "ground_truth": ground_truth,
@@ -637,6 +649,8 @@ async def main():
 
         with open(out, "a", encoding="utf-8") as f:
             f.write(json.dumps(result_item, ensure_ascii=False) + "\n")
+        with open(debug_out, "a", encoding="utf-8") as f:
+            f.write(json.dumps(debug_item, ensure_ascii=False) + "\n")
 
         total_processed += 1
         if is_correct:
