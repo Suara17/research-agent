@@ -4,6 +4,7 @@ Search Optimization Module
 Question type classification and smart query rewriting
 """
 import re
+from typing import Optional, List
 
 
 def classify_query_type(query: str) -> dict:
@@ -73,12 +74,45 @@ def classify_query_type(query: str) -> dict:
     return query_type
 
 
-def smart_query_rewrite(query: str, query_type: dict) -> str:
+def build_query_from_slots(slots: dict, original_query: str) -> Optional[str]:
     """
-    根据问题类型智能重写查询
+    根据 slot 抽取结果构建精准搜索串。
+    anchors 作为主体，hard_constraints 作为限定词。
+    返回 None 表示 slot 无效，调用方应回退到原始 query。
     """
+    anchors: List[str] = slots.get("anchors") or []
+    hard_constraints: List[str] = slots.get("hard_constraints") or []
+    target_country: Optional[str] = slots.get("target_country")
+
+    if not anchors:
+        return None
+
+    parts = list(anchors)  # anchors 优先
+    parts.extend(hard_constraints[:2])  # 最多取2个硬约束，避免过度限制
+    if target_country:
+        parts.append(target_country)
+
+    query = " ".join(parts)
+    # 不超过原始 query 长度的2倍，防止生成过长串
+    return query if len(query) <= len(original_query) * 2 + 30 else None
+
+
+def smart_query_rewrite(query: str, query_type: dict, slots: Optional[dict] = None) -> str:
+    """
+    根据问题类型智能重写查询。
+    优先使用 slots（来自 LLM slot 抽取）构建搜索串；
+    slots 无效时回退到规则式关键词拼接。
+    """
+    # P0: 优先用 slot 抽取结果构建查询
+    if slots:
+        slot_query = build_query_from_slots(slots, query)
+        if slot_query:
+            print(f"[QueryRewrite] slot-based: '{query}' → '{slot_query}'")
+            return slot_query
+
+    # 原有规则式逻辑（fallback）
     strategy = query_type.get("search_strategy", "general")
-    
+
     if strategy == "company_focused":
         keywords = []
         locations = re.findall(r"(东亚|南欧|北欧|西欧|欧洲|亚洲|北美|日本|意大利|法国|德国|英国|美国|西班牙|韩国)", query)
@@ -91,7 +125,7 @@ def smart_query_rewrite(query: str, query_type: dict) -> str:
             keywords.append("创始人")
         if keywords:
             return " ".join(keywords)
-    
+
     elif strategy == "person_focused":
         keywords = []
         roles = re.findall(r"(天文学家|科学家|政治家|艺术家|作家|企业家)", query)
@@ -100,7 +134,7 @@ def smart_query_rewrite(query: str, query_type: dict) -> str:
         keywords.extend(nationalities)
         if keywords:
             return " ".join(keywords)
-    
+
     elif strategy == "time_focused":
         keywords = []
         years = re.findall(r"\d{4}年", query)
@@ -111,7 +145,7 @@ def smart_query_rewrite(query: str, query_type: dict) -> str:
             keywords.append("创办")
         if keywords:
             return " ".join(keywords)
-    
+
     return None  # 返回 None 表示使用默认处理
 
 
